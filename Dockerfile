@@ -1,5 +1,5 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY tvoe_wordstat_bot.py ./tvoe_wordstat_bot.py
+COPY bot_fixed.py ./bot_fixed.py
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "tvoe_wordstat_bot.py"]
+CMD ["python", "bot_fixed.py"]
