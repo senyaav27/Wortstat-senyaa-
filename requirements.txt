@@ -1,0 +1,1 @@
+# Python 3.11+. The bot uses only the standard library.
