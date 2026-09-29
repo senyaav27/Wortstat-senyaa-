@@ -452,7 +452,7 @@ class BotApp:
             except RuntimeError: pass
         raw = (callback or update.get('message') or {}).get('data') if callback else (update.get('message') or {}).get('text','')
         raw = raw or ''
-        command = raw.split()[0].split('@')[0].lstrip('/') if raw else ''
+        command = raw.split()[0].split('@')[0].lstrip('/').split(':', 1)[0] if raw else ''
         if raw in ('menu','start') or command == 'start':
             self.bot.send('🎬 TVOЁ - спрос на контент «Скоро в подписке». Выберите раздел.', MENU)
         elif command in ('top','growth','soon','new'):
