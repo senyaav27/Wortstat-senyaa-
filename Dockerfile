@@ -1,5 +1,5 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY alerts_bot.py ./alerts_bot.py
+COPY ui2027_bot.py ./ui2027_bot.py
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "alerts_bot.py"]
+CMD ["python", "ui2027_bot.py"]
