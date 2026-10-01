@@ -154,7 +154,9 @@ def weekly_comparison(points):
                 values[day] = count
         except (ValueError, TypeError, KeyError):
             continue
-    end = today - timedelta(days=1)
+    if not values:
+        return None
+    end = max(values)
     days = [end - timedelta(days=i) for i in range(13,-1,-1)]
     if any(day not in values for day in days):
         return None
@@ -238,6 +240,12 @@ class Store:
             if not self.meta('review_queue_migrated'):
                 self.db.execute("INSERT OR IGNORE INTO review_queue(title_id,added_at,notified_at) SELECT title_id,at,at FROM events WHERE kind='new' AND at > (SELECT MIN(at) FROM events WHERE kind='new')")
                 self.set_meta('review_queue_migrated','1')
+
+            # Recalculate current classification from saved points, preserving history.
+            for row in self.db.execute('SELECT id,dynamics_json FROM titles WHERE dynamics_json IS NOT NULL').fetchall():
+                try: direction,delta = trend(json.loads(row['dynamics_json']))
+                except (ValueError,TypeError): continue
+                self.db.execute('UPDATE titles SET trend=?,delta=? WHERE id=?',(direction,delta,row['id']))
 
     def save_ad(self, ident, fields):
         status = fields.get('status','')
@@ -624,8 +632,8 @@ def title_analysis(store, row, csrf_field):
         chart=f'<svg class="demand-chart" viewBox="0 0 320 104" role="img" aria-label="Поисковые запросы по дням"><path d="{" ".join(path)}" fill="none" stroke="currentColor" stroke-width="2"/></svg><p>{lo.isoformat()} - {hi.isoformat()} · максимум {peak} запросов в день</p>'
     if comparison:
         pct=f'{comparison["percent"]:+.1f}%' if comparison['percent'] is not None else 'процент не определён: предыдущий период равен нулю'
-        info += f'<p><strong>{pct}</strong> · {comparison["older"]} → {comparison["newer"]} запросов<br>{comparison["from"]} - {comparison["to"]}: два полных периода по 7 дней (UTC), текущий день исключён.</p>'
-    else: info += '<p>Для сравнения нужны данные за последние 14 полных дней подряд. Пропуски не считаются нулями.</p>'
+        info += f'<p><strong>{pct}</strong> · {comparison["older"]} → {comparison["newer"]} запросов<br>{comparison["from"]} - {comparison["to"]}: два полных периода по 7 дней (UTC) по последнюю доступную дату Wordstat.</p>'
+    else: info += '<p>Для сравнения нужны 14 полных дней подряд по последнюю доступную дату Wordstat. Пропуски не считаются нулями.</p>'
     return f'<details class="analysis"><summary>Спрос и динамика</summary>{info}{chart}</details>'
 
 
