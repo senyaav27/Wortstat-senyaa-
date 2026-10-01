@@ -143,23 +143,35 @@ def choose_query(item, top):
     return candidate, 'Уточнено из-за неоднозначности названия.' if matched else 'Неоднозначное название; соответствие произведению требует ручной проверки.', not matched
 
 
+def weekly_comparison(points):
+    today = datetime.now(UTC).date()
+    values = {}
+    for point in points or []:
+        try:
+            day = date.fromisoformat(str(point['date'])[:10])
+            count = int(point['count'])
+            if count >= 0 and day < today and day not in values:
+                values[day] = count
+        except (ValueError, TypeError, KeyError):
+            continue
+    end = today - timedelta(days=1)
+    days = [end - timedelta(days=i) for i in range(13,-1,-1)]
+    if any(day not in values for day in days):
+        return None
+    older = sum(values[d] for d in days[:7])
+    newer = sum(values[d] for d in days[7:])
+    return {'older':older,'newer':newer,'delta':newer-older,
+            'percent':(newer-older)*100/older if older else None,
+            'from':days[0].isoformat(),'split':days[7].isoformat(),'to':end.isoformat()}
+
+
 def trend(points):
-    valid = sorted((p for p in points if isinstance(p, dict) and str(p.get('count', '')).isdigit()), key=lambda p: p.get('date', ''))
-    if len(valid) < 8:
+    comparison = weekly_comparison(points)
+    if comparison is None:
         return 'недостаточно данных', None
-    n = min(7, len(valid) // 2)
-    older = sum(int(x['count']) for x in valid[-2*n:-n])
-    newer = sum(int(x['count']) for x in valid[-n:])
-    delta = newer - older
-    # Noise guard: avoid labeling small changes as directional.
-    if older == 0 and newer == 0:
-        direction = 'стабильно'
-    elif older == 0:
-        direction = 'растёт'
-    elif abs(delta) / older < 0.15:
-        direction = 'стабильно'
-    else:
-        direction = 'растёт' if delta > 0 else 'падает'
+    older, newer, delta = comparison['older'],comparison['newer'],comparison['delta']
+    direction = ('стабильно' if older == newer or (older and abs(delta)/older < .15)
+                 else 'растёт' if delta > 0 else 'падает')
     return direction, delta
 
 
@@ -220,10 +232,42 @@ class Store:
             ''')
 
         with self.db:
+            self.db.execute('CREATE TABLE IF NOT EXISTS ad_status (title_id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS ad_tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title_id TEXT NOT NULL, at TEXT NOT NULL, start_date TEXT, end_date TEXT, spend REAL, registrations INTEGER, trials INTEGER, payments INTEGER, note TEXT)')
             self.db.execute('CREATE TABLE IF NOT EXISTS review_queue (title_id TEXT PRIMARY KEY, added_at TEXT NOT NULL, reviewed_at TEXT, notified_at TEXT)')
             if not self.meta('review_queue_migrated'):
                 self.db.execute("INSERT OR IGNORE INTO review_queue(title_id,added_at,notified_at) SELECT title_id,at,at FROM events WHERE kind='new' AND at > (SELECT MIN(at) FROM events WHERE kind='new')")
                 self.set_meta('review_queue_migrated','1')
+
+    def save_ad(self, ident, fields):
+        status = fields.get('status','')
+        if status not in ('Рассмотреть','Запущено','Отложено'):
+            raise ValueError('Выберите статус')
+        if not self.db.execute('SELECT 1 FROM titles WHERE id=?',(ident,)).fetchone():
+            raise ValueError('Тайтл не найден')
+        numbers = []
+        for key in ('spend','registrations','trials','payments'):
+            raw = fields.get(key,'').strip().replace(',','.')
+            value = (float(raw) if key=='spend' else int(raw)) if raw else None
+            if value is not None and (value < 0 or value > 1000000000 or not __import__('math').isfinite(value)):
+                raise ValueError('Показатели должны быть конечными неотрицательными числами')
+            numbers.append(value)
+        dates = [fields.get(k,'').strip() for k in ('start_date','end_date')]
+        for d in dates:
+            if d: date.fromisoformat(d)
+        if all(dates) and dates[0] > dates[1]:
+            raise ValueError('Начало периода позже окончания')
+        note = fields.get('note','').strip()[:1000]
+        with self.lock, self.db:
+            self.db.execute('INSERT INTO ad_status VALUES(?,?,?) ON CONFLICT(title_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at',(ident,status,now()))
+            if any(v is not None for v in numbers) or note:
+                self.db.execute('INSERT INTO ad_tests(title_id,at,start_date,end_date,spend,registrations,trials,payments,note) VALUES(?,?,?,?,?,?,?,?,?)',(ident,now(),*dates,*numbers,note))
+
+    def ad_info(self, ident):
+        with self.lock:
+            row = self.db.execute('SELECT status FROM ad_status WHERE title_id=?',(ident,)).fetchone()
+            tests = [dict(x) for x in self.db.execute('SELECT * FROM ad_tests WHERE title_id=? ORDER BY id DESC',(ident,))]
+        return (row['status'] if row else 'Рассмотреть'), tests
 
     def new_rows(self):
         return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000)
@@ -336,8 +380,10 @@ class Analyzer:
                     self.store.measured(row['id'],query,note,ambiguous,count,None)
                     if count <= 50000:
                         self.store.set_meta('growth_alert:'+row['id'],'quiet')
+                    self.store.set_meta('top_error:'+row['id'],'')
                     stats['measured'] += 1
                 except APIError as exc:
+                    self.store.set_meta('top_error:'+row['id'], now()+' | '+str(exc))
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
                         break
@@ -352,6 +398,7 @@ class Analyzer:
                     points = self.wordstat.dynamics(row['wordstat_query'])
                     self.store.attach_dynamics(row['id'],points)
                     self.store.set_meta('dynamics_checked:'+row['id'],now())
+                    self.store.set_meta('dynamics_error:'+row['id'],'')
                     stats['dynamics'] += 1
                     direction, delta = trend(points)
                     if direction == 'растёт' and delta is not None and delta > 0:
@@ -364,6 +411,7 @@ class Analyzer:
                     else:
                         self.store.set_meta('growth_alert:'+row['id'],'quiet')
                 except APIError as exc:
+                    self.store.set_meta('dynamics_error:'+row['id'],now()+' | '+str(exc))
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
                         break
@@ -539,8 +587,56 @@ form{display:flex;gap:8px;min-width:260px}input{min-width:0;width:210px;border:1
 .notice{margin-top:28px;color:var(--muted);font-size:.82rem;max-width:760px}.entry .review-action{grid-column:2 / -1;min-width:0;margin:2px 0 0;justify-content:flex-end}.review-button{min-height:44px;padding:8px 12px;background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:8px;font-size:.78rem;font-weight:600;white-space:nowrap}.review-button:hover{color:var(--ink);border-color:var(--muted)}@media(max-width:700px){.entry .review-action{grid-column:1 / -1;margin-top:8px}}
 .lock{max-width:540px;margin:12vh auto;padding:28px}.lock h1{font-size:2.8rem}.lock p{color:var(--muted)}.lock code{font:inherit;color:var(--accent)}
 @media(max-width:700px){.head{padding:14px 18px}.stamp{font-size:.68rem}main{padding:31px 16px 55px}.hero{display:block;padding-bottom:25px}.hero-facts{text-align:left;margin-top:20px}.signal-summary{padding:16px;gap:10px}.signal-summary b{font-size:.78rem}nav{gap:22px}.section-head{display:block}.section-head p{margin-top:5px}.controls{display:block}.modes{width:100%;justify-content:space-between}.mode{flex:1;text-align:center;padding:8px 7px;font-size:.78rem}form{margin-top:12px;min-width:0}input{width:100%;flex:1}.entry{grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;padding:15px 16px}.when{grid-column:1 / -1;color:var(--accent);font-size:.77rem}.demand{font-size:1rem}.demand small{font-size:.65rem}.title{font-size:1.06rem}.detail{font-size:.76rem}}
+.analysis{grid-column:1 / -1;font-size:.82rem;min-width:0}.analysis summary{cursor:pointer;padding:10px 0;color:var(--muted)}.analysis p{line-height:1.5;color:var(--muted)}.demand-chart{width:100%;max-width:640px;height:150px;color:var(--accent)}.data-error{color:#9c2424!important}.entry .ad-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));min-width:0;margin:16px 0;gap:12px}.ad-form label{display:grid;gap:6px;min-width:0}.ad-form input,.ad-form select,.ad-form textarea{box-sizing:border-box;width:100%;min-width:0;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit}.ad-form .wide{grid-column:1 / -1}.analysis li{padding:10px 0;overflow-wrap:anywhere}@media(max-width:700px){.entry .ad-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 """
+
+
+def title_analysis(store, row, csrf_field):
+    esc = html.escape
+    try: points = json.loads(row['dynamics_json'] or '[]')
+    except (ValueError,TypeError): points=[]
+    comparison = weekly_comparison(points)
+    checked = store.meta('dynamics_checked:'+row['id'],'')
+    freshness = ('Проверено '+date_text(row['measured_at'])) if row['measured_at'] else 'Спрос ещё не проверен'
+    if row['measured_at']:
+        try:
+            if datetime.now(UTC)-datetime.fromisoformat(row['measured_at']) > timedelta(days=3): freshness += ' · данные старше 3 дней'
+        except ValueError: pass
+    errors = [store.meta(k+row['id'],'') for k in ('top_error:','dynamics_error:')]
+    err = '<p class="data-error">'+esc('; '.join(e for e in errors if e))+'</p>' if any(errors) else ''
+    info = '<p>'+esc(freshness)+' · Динамика: '+esc(row['trend'] or 'ещё не получена')+'<br>Динамика проверена: '+esc(date_text(checked) if checked else 'дата неизвестна')+'</p>'+err
+    chart = ''
+    valid=[]
+    for pt in points:
+        try:
+            d=date.fromisoformat(str(pt['date'])[:10]);c=int(pt['count'])
+            if d < datetime.now(UTC).date() and c>=0: valid.append((d,c))
+        except (ValueError,TypeError,KeyError): pass
+    valid=sorted(valid)[-28:]
+    if len(valid)>1:
+        lo,hi=valid[0][0],valid[-1][0];span=max(1,(hi-lo).days);peak=max(1,max(c for _,c in valid))
+        path=[]
+        previous=None
+        for d,c in valid:
+            op='M' if previous is None or (d-previous).days!=1 else 'L'
+            path.append(f'{op}{8+(d-lo).days*304/span:.1f},{92-c*76/peak:.1f}');previous=d
+        chart=f'<svg class="demand-chart" viewBox="0 0 320 104" role="img" aria-label="Поисковые запросы по дням"><path d="{" ".join(path)}" fill="none" stroke="currentColor" stroke-width="2"/></svg><p>{lo.isoformat()} - {hi.isoformat()} · максимум {peak} запросов в день</p>'
+    if comparison:
+        pct=f'{comparison["percent"]:+.1f}%' if comparison['percent'] is not None else 'процент не определён: предыдущий период равен нулю'
+        info += f'<p><strong>{pct}</strong> · {comparison["older"]} → {comparison["newer"]} запросов<br>{comparison["from"]} - {comparison["to"]}: два полных периода по 7 дней (UTC), текущий день исключён.</p>'
+    else: info += '<p>Для сравнения нужны данные за последние 14 полных дней подряд. Пропуски не считаются нулями.</p>'
+    status,tests=store.ad_info(row['id'])
+    options=''.join(f'<option{" selected" if status==x else ""}>{x}</option>' for x in ('Рассмотреть','Запущено','Отложено'))
+    fields=''.join(f'<label>{label}<input name="{key}" type="number" min="0" max="1000000000" step="{step}"></label>' for key,label,step in [('spend','Расход, ₽','0.01'),('registrations','Регистрации','1'),('trials','Триалы','1'),('payments','Оплаты','1')])
+    history=[]
+    for test in tests:
+        metrics=[]
+        for key,label in [('registrations','регистрацию'),('trials','триал'),('payments','оплату')]:
+            if test['spend'] is not None and test[key] is not None:
+                metrics.append(f'CPA за {label}: '+(f'{test["spend"]/test[key]:.2f} ₽' if test[key] else 'нет конверсий'))
+        history.append('<li>'+esc(f'{date_text(test["at"])} · период {test["start_date"] or "не указан"} - {test["end_date"] or "не указан"} · расход: {test["spend"] if test["spend"] is not None else "не указан"} ₽ · регистрации: {test["registrations"] if test["registrations"] is not None else "не указаны"} · триалы: {test["trials"] if test["trials"] is not None else "не указаны"} · оплаты: {test["payments"] if test["payments"] is not None else "не указаны"}')+'<br>'+esc('; '.join(metrics))+'<br>'+esc(test['note'] or '')+'</li>')
+    return f'''<details class="analysis"><summary>Спрос и рекламный тест · {esc(status)}</summary>{info}{chart}<form class="ad-form" action="/ad" method="post">{csrf_field}<input type="hidden" name="id" value="{esc(row['id'],quote=True)}"><label>Статус<select name="status">{options}</select></label><label>Начало теста<input name="start_date" type="date"></label><label>Конец теста<input name="end_date" type="date"></label>{fields}<label class="wide">Комментарий<textarea name="note" maxlength="1000"></textarea></label><button type="submit">Сохранить</button><p class="wide">Показатели вносятся вручную за один тест. Каждое сохранение результатов добавляет запись в историю. Статус не отключает сигналы роста.</p></form><ul>{''.join(history)}</ul></details>'''
 
 
 def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
@@ -596,10 +692,11 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         raw_url = row['url'] or ''
         safe_link = 'https://tvoe.live' + raw_url if raw_url.startswith('/') and not raw_url.startswith('//') else ''
         heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
+        analysis = title_analysis(store,row,csrf_field)
         review = (f'<form class="review-action" action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit" title="Убрать из нового: проверка рекламы завершена" aria-label="Проверено для рекламы">✓ Проверено</button></form>' if view=='new' else '')
         entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
                        f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
-                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}</article>')
+                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}{analysis}</article>')
     empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
              'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
              'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
@@ -625,6 +722,8 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
             + (f'<input type="hidden" name="mode" value="{mode}">' if view=='catalog' else '')
             + f'<input type="search" name="q" value="{searched}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button type="submit">Найти</button></form>')
+    errors = store.meta('last_errors','')
+    error_notice = '<p class="notice">Последнее обновление: '+escape(errors)+'</p>' if errors else ''
     summary = ('<strong>' + (f'{len(signal_rows)} сигналов для проверки рекламы' if signal_rows else 'Сигналов для рекламы пока нет') + '</strong>'
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
@@ -632,7 +731,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
 <main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
 <a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
 <nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{heading}</h2><p>{descriptions[view]}</p></div>
-<div class="controls">{controls}{form}</div>{content}
+<div class="controls">{controls}{form}</div>{error_notice}{content}
 <p class="notice">Wordstat показывает количество поисковых запросов по фразе, а не просмотры фильма. Общие названия помечены как неоднозначные. Сигнал помогает выбрать тайтл для проверки рекламной гипотезы, а не гарантирует результат кампании.</p></main></body></html>'''
 
 
@@ -670,19 +769,25 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review'):
+            if path in ('/refresh','/review','/ad'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
                     size = int(self.headers.get('Content-Length','0'))
-                    if size < 0 or size > 4096:
+                    if size < 0 or size > (16384 if path == '/ad' else 4096):
                         return self.respond(413)
                     fields = parse_qs(self.rfile.read(size).decode('utf-8'))
                 except (ValueError,UnicodeError):
                     return self.respond(400)
                 if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
                     return self.respond(403)
-                if path == '/review':
+                if path == '/ad':
+                    try:
+                        store.save_ad(fields.get('id',[''])[0], {k:v[0] for k,v in fields.items()})
+                    except (ValueError,OverflowError):
+                        return self.respond(400,'Некорректные данные. Проверьте период и неотрицательные показатели; вернитесь назад.'.encode())
+                    target = '/'
+                elif path == '/review':
                     store.mark_reviewed(fields.get('id',[''])[0])
                     target = '/?view=new'
                 else:
@@ -895,4 +1000,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
