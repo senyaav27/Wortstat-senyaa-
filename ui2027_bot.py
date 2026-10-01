@@ -1,6 +1,8 @@
 """Private TVOЁ + Yandex Wordstat analytics bot. Configure environment variables, then run this file."""
 """TVOЁ collection, Wordstat measurements, persistence, and trend calculations."""
 import json
+import csv
+import io
 import base64
 import binascii
 import hashlib
@@ -638,19 +640,153 @@ def title_analysis(store, row, csrf_field):
 
 
 
+NETFLIX_DATA_URL = 'https://www.netflix.com/tudum/top10/data/all-weeks-global.tsv'
+NETFLIX_CATEGORIES = {'english':'TV (English)', 'nonenglish':'TV (Non-English)'}
+
+
+def netflix_schema(store):
+    with store.lock, store.db:
+        store.db.execute('CREATE TABLE IF NOT EXISTS netflix_ranks (week TEXT NOT NULL, category TEXT NOT NULL, rank INTEGER NOT NULL, title TEXT NOT NULL, season TEXT NOT NULL, views INTEGER, hours INTEGER, weeks INTEGER NOT NULL, PRIMARY KEY(week,category,rank), UNIQUE(week,category,title,season))')
+
+
+def parse_netflix(text):
+    reader = csv.DictReader(io.StringIO(text.lstrip('\ufeff')), delimiter='\t')
+    required = {'week','category','weekly_rank','show_title','season_title','weekly_hours_viewed','weekly_views','cumulative_weeks_in_top_10'}
+    if not required.issubset(reader.fieldnames or []): raise ValueError('Invalid Netflix columns')
+    groups = {}
+    def number(value):
+        if value in ('','N/A',None): return None
+        n = int(value)
+        if n < 0: raise ValueError('Negative Netflix metric')
+        return n
+    for r in reader:
+        if r['category'] not in NETFLIX_CATEGORIES.values(): continue
+        week = date.fromisoformat(r['week'])
+        if week.weekday()!=6 or week >= datetime.now(UTC).date(): raise ValueError('Invalid Netflix week')
+        rank = int(r['weekly_rank']); title = r['show_title'].strip(); season = r['season_title'].strip()
+        if not 1 <= rank <= 10 or not title or not season: raise ValueError('Invalid Netflix title/rank')
+        group = groups.setdefault((week.isoformat(),r['category']), [])
+        group.append((week.isoformat(),r['category'],rank,title,season,number(r['weekly_views']),number(r['weekly_hours_viewed']),number(r['cumulative_weeks_in_top_10']) or 0))
+    if not groups: raise ValueError('Empty Netflix data')
+    latest = max(w for w,c in groups)
+    for category in NETFLIX_CATEGORIES.values():
+        if (latest,category) not in groups: raise ValueError('Incomplete latest Netflix categories')
+    for rows in groups.values():
+        if sorted(r[2] for r in rows)!=list(range(1,11)) or len({(r[3],r[4]) for r in rows})!=10: raise ValueError('Incomplete/duplicate Netflix ranking')
+    return [r for rows in groups.values() for r in rows]
+
+
+def netflix_import(store, text):
+    rows = parse_netflix(text)  # Validate all before touching persistent data.
+    netflix_schema(store)
+    with store.lock, store.db:
+        # One immutable weekly record per ranking; repeat downloads do not invent snapshots.
+        store.db.executemany('INSERT OR IGNORE INTO netflix_ranks VALUES(?,?,?,?,?,?,?,?)',rows)
+        stamp = now()
+        store.db.execute('INSERT INTO metadata(key,value) VALUES("netflix_updated",?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(stamp,))
+        store.db.execute('INSERT INTO metadata(key,value) VALUES("netflix_error","") ON CONFLICT(key) DO UPDATE SET value=""')
+    return len(rows)
+
+
+def netflix_refresh(store, force=False):
+    checked = store.meta('netflix_checked','')
+    if checked and not force:
+        try:
+            if datetime.now(UTC)-datetime.fromisoformat(checked)<timedelta(hours=12): return False
+        except ValueError: pass
+    store.set_meta('netflix_checked',now())
+    try:
+        req = Request(NETFLIX_DATA_URL,headers={'Accept':'text/tab-separated-values','User-Agent':'TVOE-Analytics/1.0'})
+        with urlopen(req,timeout=25) as response:
+            raw = response.read(5_000_001)
+        if len(raw)>5_000_000: raise ValueError('Netflix data too large')
+        netflix_import(store,raw.decode('utf-8-sig'))
+        return True
+    except (HTTPError,URLError,TimeoutError,ValueError,UnicodeError,OSError) as exc:
+        store.set_meta('netflix_error',type(exc).__name__)
+        print('Netflix refresh failed: '+type(exc).__name__,flush=True)
+        return False
+
+
+def netflix_current(store, mode='english'):
+    netflix_schema(store)
+    category = NETFLIX_CATEGORIES.get(mode,NETFLIX_CATEGORIES['english'])
+    with store.lock:
+        week = store.db.execute('SELECT MAX(week) FROM netflix_ranks WHERE category=?',(category,)).fetchone()[0]
+        if not week: return '',[],[]
+        previous = (date.fromisoformat(week)-timedelta(days=7)).isoformat()
+        prev = {(r['title'],r['season']):dict(r) for r in store.db.execute('SELECT * FROM netflix_ranks WHERE week=? AND category=?',(previous,category))}
+        rows = [dict(r) for r in store.db.execute('SELECT * FROM netflix_ranks WHERE week=? AND category=? ORDER BY rank',(week,category))]
+    current = {(r['title'],r['season']) for r in rows}
+    for r in rows:
+        old = prev.get((r['title'],r['season']))
+        r['previous'] = old['rank'] if old else None
+        r['change'] = old['rank']-r['rank'] if old else None
+        r['movement'] = (f'#{old["rank"]} → #{r["rank"]} '+(f'↑{r["change"]}' if r['change']>0 else f'↓{-r["change"]}' if r['change']<0 else '- без изменений')) if old else ('NEW' if prev else 'нет предыдущей недели')
+    return week,rows,[r for key,r in prev.items() if key not in current]
+
+
+def netflix_match(store, row):
+    # Existing database has Russian names, no IMDb ID or original-title field.
+    # Only unique exact normalized series-name matches are accepted.
+    def norm(s): return re.sub(r'[^\w]+',' ',s.casefold().replace('ё','е')).strip()
+    matches = [r for r in store.rows('title ASC',limit=10000) if r['type']=='serials' and norm(r['title'])==norm(row['title'])]
+    return matches[0] if len(matches)==1 else None
+
+
+def netflix_content(store,mode,query,csrf_field):
+    mode = mode if mode in NETFLIX_CATEGORIES else 'english'
+    week,rows,exited = netflix_current(store,mode)
+    esc = html.escape
+    switches = ''.join(f'<a class="mode{" active" if key==mode else ""}" href="/?view=netflix&amp;mode={key}">{label}</a>' for key,label in [('english','Англоязычные'),('nonenglish','Неанглоязычные')])
+    content = '<div class="modes netflix-modes">'+switches+'</div>'
+    content += '<p class="notice"><a href="https://www.netflix.com/tudum/top10/tv" target="_blank" rel="noopener noreferrer">Источник: Netflix Tudum</a>. Глобальный недельный TOP-10 сериалов. Категории и сезоны учитываются отдельно.</p>'
+    if not week:
+        return content+'<div class="empty"><strong>Рейтинг ещё не загружен</strong>Данные загрузятся автоматически. При недоступности Netflix повторим проверку позже.</div>'
+    start = date.fromisoformat(week)-timedelta(days=6)
+    content += f'<p class="notice">Неделя: {start.isoformat()} - {week}. Проверка источника: {esc(date_text(store.meta("netflix_updated","")))}. Новые позиции сохраняются только за новые недели.</p>'
+    if datetime.now(UTC).date()-date.fromisoformat(week)>timedelta(days=10):content += '<p class="notice">Рейтинг за прошлую неделю или более ранний период. Дата периода указана выше.</p>'
+    if store.meta('netflix_error',''):content += '<p class="notice">Netflix временно не обновился. Показан последний сохранённый рейтинг.</p>'
+    cards = []
+    for r in rows:
+        if query and query.casefold() not in (r['title']+' '+r['season']).casefold():continue
+        metric = f'{r["views"]:,}'.replace(',',' ') if r['views'] is not None else 'нет данных'
+        match = netflix_match(store,r)
+        overlap = ''
+        if match:
+            overlap = '<p class="netflix-overlap">Совпадение названия в TVOЁ · '+esc(match['poster_date'] or 'дата не указана')+'</p>'
+            if match['total_count'] is not None:
+                overlap += '<p>Wordstat: '+f'{match["total_count"]:,}'.replace(',',' ')+' запросов / 30 дней<br>Запрос: '+esc(match['wordstat_query'] or '')+(' · неоднозначный' if match['ambiguous'] else '')+'</p>'+title_analysis(store,match,csrf_field)
+        with store.lock:
+            history = [dict(x) for x in store.db.execute('SELECT week,rank,views FROM netflix_ranks WHERE category=? AND title=? AND season=? ORDER BY week DESC LIMIT 12',(r['category'],r['title'],r['season']))]
+        hist = ''.join(f'<li>{x["week"]}: #{x["rank"]} · '+(f'{x["views"]:,}'.replace(',',' ')+' просмотров' if x['views'] is not None else 'просмотры не указаны')+'</li>' for x in history)
+        cards.append(f'<article class="netflix-card"><div class="netflix-rank">{r["rank"]}</div><h3>{esc(r["season"] if r["season"]!="N/A" else r["title"])}</h3><p class="trend">{esc(r["movement"])}</p><strong>{metric}</strong><small> просмотров за неделю</small><p>{r["weeks"]} недель в TOP-10<br>Часы просмотра: {r["hours"] if r["hours"] is not None else "нет данных"}</p>{overlap}<details><summary>История позиций</summary><ul>{hist}</ul></details></article>')
+    content += '<div class="netflix-strip">'+(''.join(cards) or '<p>По этому названию ничего не найдено.</p>')+'</div>'
+    if exited:content += '<p class="notice">Вышли из TOP-10 относительно предыдущей недели: '+esc('; '.join(r['season'] for r in exited))+'.</p>'
+    return content
+
+
+NETFLIX_CSS = '''
+.netflix-modes{display:inline-flex;margin:8px 0;max-width:100%}.netflix-strip{display:flex;gap:16px;overflow-x:auto;scroll-snap-type:x mandatory;padding:22px 0;align-items:stretch}.netflix-card{flex:0 0 280px;scroll-snap-align:start;background:var(--white);border:1px solid var(--line);border-radius:16px;padding:20px;overflow-wrap:anywhere}.netflix-rank{font-size:4rem;line-height:1;font-weight:800;color:var(--accent);margin-bottom:22px}.netflix-card h3{font-size:1.2rem;margin:0 0 14px;min-height:3em}.netflix-card p,.netflix-card small,.netflix-card li{font-size:.82rem;line-height:1.5;color:var(--muted)}.netflix-card .trend{margin-left:0;color:var(--accent)}.netflix-card summary{cursor:pointer;padding:10px 0}.netflix-overlap{font-weight:700}.netflix-card ul{padding-left:18px}@media(max-width:700px){.netflix-card{flex-basis:78vw;max-width:320px;padding:18px}.netflix-strip{gap:12px}}
+'''
+
+
+
 def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     csrf_field = '<input type="hidden" name="csrf" value="' + html.escape(csrf,quote=True) + '">'
     legacy = {'soon':('catalog','date'),'top':('catalog','top'),
               'growth':('catalog','growth'),'ads':('signals','date')}
     view, mode = legacy.get(view,(view,mode))
-    view = view if view in ('catalog','signals','new') else 'catalog'
-    mode = mode if mode in ('date','top','growth') else 'date'
+    view = view if view in ('catalog','signals','new','netflix') else 'catalog'
+    mode = mode if mode in ('date','top','growth','english','nonenglish') else 'date'
     all_rows = store.rows('title ASC',limit=10000)
     new_rows = store.new_rows()
     signal_rows = [row for row in all_rows if row['total_count'] is not None
                    and row['total_count'] > 50000 and row['trend']=='растёт'
                    and not row['ambiguous']]
-    if view == 'signals':
+    if view == 'netflix':
+        rows = []
+    elif view == 'signals':
         rows = sorted(signal_rows,key=lambda r:r['delta'] or 0,reverse=True)
     elif view == 'new':
         rows = sorted(new_rows,key=lambda r:r['first_seen'],reverse=True)
@@ -666,7 +802,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         rows = [row for row in rows if query.casefold() in row['title'].casefold()]
     escape = html.escape
     tabs = [('catalog','Каталог',len(all_rows)),('signals','Сигналы',len(signal_rows)),
-            ('new','Новое',len(new_rows))]
+            ('new','Новое',len(new_rows)),('netflix','Netflix Тренды',10 if netflix_current(store)[1] else 0)]
     links = ''.join(f'<a class="tab{" active" if view==key else ""}" href="/?view={key}"'
                     f'{" aria-current=page" if view==key else ""}>{label} · {count}</a>'
                     for key,label,count in tabs)
@@ -698,13 +834,14 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
                        f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}{analysis}</article>')
     empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
              'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
-             'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
+             'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».'),'netflix':('Рейтинг загружается','Данные Netflix обновятся автоматически.')}
     if query and not entries:
         empty_text = ('Ничего не найдено','Попробуйте другое название или откройте каталог.')
     else:
         empty_text = empty[view]
     content = '<div class="list">' + (''.join(entries) if entries else
               f'<div class="empty"><strong>{empty_text[0]}</strong>{empty_text[1]}</div>') + '</div>'
+    if view=='netflix': content = netflix_content(store,mode,query,csrf_field)
     updated = store.meta('last_tvoe','')
     try:
         stamp = datetime.fromisoformat(updated.replace('Z','+00:00')).astimezone(ZoneInfo('Europe/Moscow'))
@@ -712,22 +849,22 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     except ValueError:
         updated_text = 'ожидается первое обновление'
     checked = sum(row['total_count'] is not None for row in all_rows)
-    heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке'}[view]
+    heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке','netflix':'Netflix Тренды'}[view]
     descriptions = {'catalog':'Один список с разными способами просмотра.',
                     'signals':'Спрос выше 50 000 и рост за последние 7 дней. Только однозначные запросы.',
-                    'new':'Добавления остаются здесь до отметки «Проверено». Рост спроса отслеживается и после проверки.'}
+                    'new':'Добавления остаются здесь до отметки «Проверено». Рост спроса отслеживается и после проверки.','netflix':'Глобальный TOP-10 сериалов за последнюю опубликованную неделю.'}
     controls = f'<div class="modes" aria-label="Сортировка каталога">{mode_links}</div>' if view=='catalog' else ''
     searched = escape(query,quote=True)
     form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
-            + (f'<input type="hidden" name="mode" value="{mode}">' if view=='catalog' else '')
+            + (f'<input type="hidden" name="mode" value="{mode}">' if view in ('catalog','netflix') else '')
             + f'<input type="search" name="q" value="{searched}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button type="submit">Найти</button></form>')
     errors = store.meta('last_errors','')
     error_notice = '<p class="notice">Часть данных не обновилась. Показаны последние сохранённые значения.</p>' if errors else ''
     summary = ('<strong>' + (f'{len(signal_rows)} сигналов для проверки рекламы' if signal_rows else 'Сигналов для рекламы пока нет') + '</strong>'
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}{NETFLIX_CSS}</style></head>
 <body><header><div class="head"><a class="brand" href="/">TVO<span>Ё</span><small>Аналитика спроса</small></a><div class="stamp">Данные TVOЁ и Wordstat<strong>{escape(updated_text)}</strong></div></div></header>
-<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
+<main><section class="hero"><div><h1>{"Netflix Тренды" if view=="netflix" else "Скоро в подписке"}</h1><p>{"Популярность сериалов по официальным данным Netflix." if view=="netflix" else "Контент TVOЁ и поисковый спрос в одном рабочем списке."}</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
 <a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
 <nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{heading}</h2><p>{descriptions[view]}</p></div>
 <div class="controls">{controls}{form}</div>{error_notice}{content}
@@ -831,7 +968,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     document = document.replace('<main>', '<main><p role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
                 body = document.encode('utf-8')
             else:
-                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
+                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}{NETFLIX_CSS}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
             self.send_header('Content-Type','text/html; charset=utf-8')
             self.send_header('Content-Length',str(len(body)))
             self.send_header('Cache-Control','no-store')
@@ -879,6 +1016,7 @@ class BotApp:
             return
         self.bot.send('🔄 Обновление запущено.')
         def run():
+            netflix_refresh(self.store)
             result = self.analyzer.refresh()
             if result.get('busy'):
                 self.bot.send('Обновление уже выполняется.')
@@ -972,6 +1110,13 @@ def main():
     store = Store(os.environ.get('DATABASE_PATH','data/tvoe.sqlite3'))
     bot = Telegram(os.environ['TELEGRAM_BOT_TOKEN'], os.environ['TELEGRAM_ALLOWED_USER_ID'])
     analyzer = Analyzer(store, Wordstat(os.environ['YANDEX_API_KEY'], os.environ['YANDEX_FOLDER_ID']), top_budget=int(os.environ.get('TOP_BUDGET','100')), dynamics_budget=int(os.environ.get('DYNAMICS_BUDGET','12')))
+    netflix_schema(store)
+    def netflix_schedule():
+        while True:
+            try: netflix_refresh(store)
+            except Exception as exc: print('Netflix scheduler failed: '+type(exc).__name__,flush=True)
+            time.sleep(3600)
+    threading.Thread(target=netflix_schedule,daemon=True).start()
     app = BotApp(bot,store,analyzer)
     analyzer.on_synced = app.send_new_alerts
     start_dashboard(store,os.environ['TELEGRAM_BOT_TOKEN'],bot.allowed,int(os.environ.get('PORT','8080')),app)
