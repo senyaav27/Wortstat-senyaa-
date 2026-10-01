@@ -536,7 +536,8 @@ form{display:flex;gap:8px;min-width:260px}input{min-width:0;width:210px;border:1
 .when{font-weight:700;color:var(--muted);font-size:.85rem}.title{font-size:1.13rem;line-height:1.25;font-weight:740;letter-spacing:-.025em;margin:0 0 5px}.title a{text-decoration:none}.title a:hover{text-decoration:underline}
 .detail{color:var(--muted);font-size:.82rem}.trend{display:inline-block;color:var(--accent);font-weight:650;margin-left:7px}.demand{text-align:right;font-size:1.11rem;font-weight:760;font-variant-numeric:tabular-nums}.demand small{display:block;font-weight:450;color:var(--muted);font-size:.72rem}
 .empty{padding:52px 22px;color:var(--muted)}.empty strong{display:block;color:var(--ink);font-size:1.05rem;margin-bottom:5px}
-.notice{margin-top:28px;color:var(--muted);font-size:.82rem;max-width:760px}.lock{max-width:540px;margin:12vh auto;padding:28px}.lock h1{font-size:2.8rem}.lock p{color:var(--muted)}.lock code{font:inherit;color:var(--accent)}
+.notice{margin-top:28px;color:var(--muted);font-size:.82rem;max-width:760px}.entry .review-action{grid-column:2 / -1;min-width:0;margin:2px 0 0;justify-content:flex-end}.review-button{min-height:44px;padding:8px 12px;background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:8px;font-size:.78rem;font-weight:600;white-space:nowrap}.review-button:hover{color:var(--ink);border-color:var(--muted)}@media(max-width:700px){.entry .review-action{grid-column:1 / -1;margin-top:8px}}
+.lock{max-width:540px;margin:12vh auto;padding:28px}.lock h1{font-size:2.8rem}.lock p{color:var(--muted)}.lock code{font:inherit;color:var(--accent)}
 @media(max-width:700px){.head{padding:14px 18px}.stamp{font-size:.68rem}main{padding:31px 16px 55px}.hero{display:block;padding-bottom:25px}.hero-facts{text-align:left;margin-top:20px}.signal-summary{padding:16px;gap:10px}.signal-summary b{font-size:.78rem}nav{gap:22px}.section-head{display:block}.section-head p{margin-top:5px}.controls{display:block}.modes{width:100%;justify-content:space-between}.mode{flex:1;text-align:center;padding:8px 7px;font-size:.78rem}form{margin-top:12px;min-width:0}input{width:100%;flex:1}.entry{grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;padding:15px 16px}.when{grid-column:1 / -1;color:var(--accent);font-size:.77rem}.demand{font-size:1rem}.demand small{font-size:.65rem}.title{font-size:1.06rem}.detail{font-size:.76rem}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 """
@@ -595,10 +596,10 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         raw_url = row['url'] or ''
         safe_link = 'https://tvoe.live' + raw_url if raw_url.startswith('/') and not raw_url.startswith('//') else ''
         heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
-        review = (f'<form action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button type="submit">Проверено для рекламы</button></form>' if view=='new' else '')
+        review = (f'<form class="review-action" action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit" title="Убрать из нового: проверка рекламы завершена" aria-label="Проверено для рекламы">✓ Проверено</button></form>' if view=='new' else '')
         entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
                        f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
-                       f'<div class="demand">{count}<small>запросов / 30 дней</small>{review}</div></article>')
+                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}</article>')
     empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
              'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
              'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
@@ -618,7 +619,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке'}[view]
     descriptions = {'catalog':'Один список с разными способами просмотра.',
                     'signals':'Спрос выше 50 000 и рост за последние 7 дней. Только однозначные запросы.',
-                    'new':'Новые добавления в «Скоро в подписке». Остаются здесь до вашей проверки рекламы.'}
+                    'new':'Добавления остаются здесь до отметки «Проверено». Рост спроса отслеживается и после проверки.'}
     controls = f'<div class="modes" aria-label="Сортировка каталога">{mode_links}</div>' if view=='catalog' else ''
     searched = escape(query,quote=True)
     form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
