@@ -604,7 +604,7 @@ def title_analysis(store, row, csrf_field):
             if datetime.now(UTC)-datetime.fromisoformat(row['measured_at']) > timedelta(days=3): freshness += ' · данные старше 3 дней'
         except ValueError: pass
     errors = [store.meta(k+row['id'],'') for k in ('top_error:','dynamics_error:')]
-    err = '<p class="data-error">'+esc('; '.join(e for e in errors if e))+'</p>' if any(errors) else ''
+    err = '<p class="data-error">Не удалось обновить часть данных спроса. Показаны последние сохранённые данные.</p>' if any(errors) else ''
     info = '<p>'+esc(freshness)+' · Динамика: '+esc(row['trend'] or 'ещё не получена')+'<br>Динамика проверена: '+esc(date_text(checked) if checked else 'дата неизвестна')+'</p>'+err
     chart = ''
     valid=[]
@@ -626,17 +626,8 @@ def title_analysis(store, row, csrf_field):
         pct=f'{comparison["percent"]:+.1f}%' if comparison['percent'] is not None else 'процент не определён: предыдущий период равен нулю'
         info += f'<p><strong>{pct}</strong> · {comparison["older"]} → {comparison["newer"]} запросов<br>{comparison["from"]} - {comparison["to"]}: два полных периода по 7 дней (UTC), текущий день исключён.</p>'
     else: info += '<p>Для сравнения нужны данные за последние 14 полных дней подряд. Пропуски не считаются нулями.</p>'
-    status,tests=store.ad_info(row['id'])
-    options=''.join(f'<option{" selected" if status==x else ""}>{x}</option>' for x in ('Рассмотреть','Запущено','Отложено'))
-    fields=''.join(f'<label>{label}<input name="{key}" type="number" min="0" max="1000000000" step="{step}"></label>' for key,label,step in [('spend','Расход, ₽','0.01'),('registrations','Регистрации','1'),('trials','Триалы','1'),('payments','Оплаты','1')])
-    history=[]
-    for test in tests:
-        metrics=[]
-        for key,label in [('registrations','регистрацию'),('trials','триал'),('payments','оплату')]:
-            if test['spend'] is not None and test[key] is not None:
-                metrics.append(f'CPA за {label}: '+(f'{test["spend"]/test[key]:.2f} ₽' if test[key] else 'нет конверсий'))
-        history.append('<li>'+esc(f'{date_text(test["at"])} · период {test["start_date"] or "не указан"} - {test["end_date"] or "не указан"} · расход: {test["spend"] if test["spend"] is not None else "не указан"} ₽ · регистрации: {test["registrations"] if test["registrations"] is not None else "не указаны"} · триалы: {test["trials"] if test["trials"] is not None else "не указаны"} · оплаты: {test["payments"] if test["payments"] is not None else "не указаны"}')+'<br>'+esc('; '.join(metrics))+'<br>'+esc(test['note'] or '')+'</li>')
-    return f'''<details class="analysis"><summary>Спрос и рекламный тест · {esc(status)}</summary>{info}{chart}<form class="ad-form" action="/ad" method="post">{csrf_field}<input type="hidden" name="id" value="{esc(row['id'],quote=True)}"><label>Статус<select name="status">{options}</select></label><label>Начало теста<input name="start_date" type="date"></label><label>Конец теста<input name="end_date" type="date"></label>{fields}<label class="wide">Комментарий<textarea name="note" maxlength="1000"></textarea></label><button type="submit">Сохранить</button><p class="wide">Показатели вносятся вручную за один тест. Каждое сохранение результатов добавляет запись в историю. Статус не отключает сигналы роста.</p></form><ul>{''.join(history)}</ul></details>'''
+    return f'<details class="analysis"><summary>Спрос и динамика</summary>{info}{chart}</details>'
+
 
 
 def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
@@ -723,7 +714,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
             + (f'<input type="hidden" name="mode" value="{mode}">' if view=='catalog' else '')
             + f'<input type="search" name="q" value="{searched}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button type="submit">Найти</button></form>')
     errors = store.meta('last_errors','')
-    error_notice = '<p class="notice">Последнее обновление: '+escape(errors)+'</p>' if errors else ''
+    error_notice = '<p class="notice">Часть данных не обновилась. Показаны последние сохранённые значения.</p>' if errors else ''
     summary = ('<strong>' + (f'{len(signal_rows)} сигналов для проверки рекламы' if signal_rows else 'Сигналов для рекламы пока нет') + '</strong>'
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
@@ -887,7 +878,7 @@ class BotApp:
             if notify:
                 message = f'Обновление завершено. Новых: {len(result["new"])}; Wordstat: {result["measured"]}; динамика: {result["dynamics"]}.'
                 if result['errors']:
-                    message += '\nОшибки: ' + '; '.join(dict.fromkeys(result['errors']))[:500]
+                    message += '\nЧасть данных не обновилась. Сохранённые значения доступны.'
                 self.bot.send(message, MENU)
             self.send_growth_alerts(result['alerts'])
         threading.Thread(target=run, daemon=True).start()
@@ -923,7 +914,7 @@ class BotApp:
         elif command == 'status':
             count = len(self.store.rows(limit=10000))
             checked = len(self.store.rows(where='status="active" AND total_count IS NOT NULL',limit=10000))
-            self.bot.send(f'Коллекция: {self.store.meta("last_tvoe","ещё не обновлялась")}\nТайтлов: {count}; проверено Wordstat: {checked}\nПолный анализ: {self.store.meta("last_full") or "ещё нет"}\nОшибки: {self.store.meta("last_errors","нет") or "нет"}', MENU)
+            self.bot.send(f'Коллекция: {self.store.meta("last_tvoe","ещё не обновлялась")}\nТайтлов: {count}; проверено Wordstat: {checked}\nПолный анализ: {self.store.meta("last_full") or "ещё нет"}\nОбновление: {"есть неполные данные" if self.store.meta("last_errors","") else "без ошибок"}', MENU)
         elif command == 'web':
             domain = os.environ.get('DASHBOARD_BASE_URL') or ('https://' + os.environ.get('RAILWAY_PUBLIC_DOMAIN','').strip())
             if not domain.startswith('https://') or domain == 'https://':
