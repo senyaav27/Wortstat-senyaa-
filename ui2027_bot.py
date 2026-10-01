@@ -219,6 +219,22 @@ class Store:
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
             ''')
 
+        with self.db:
+            self.db.execute('CREATE TABLE IF NOT EXISTS review_queue (title_id TEXT PRIMARY KEY, added_at TEXT NOT NULL, reviewed_at TEXT, notified_at TEXT)')
+            if not self.meta('review_queue_migrated'):
+                self.db.execute("INSERT OR IGNORE INTO review_queue(title_id,added_at,notified_at) SELECT title_id,at,at FROM events WHERE kind='new' AND at > (SELECT MIN(at) FROM events WHERE kind='new')")
+                self.set_meta('review_queue_migrated','1')
+
+    def new_rows(self):
+        return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000)
+
+    def mark_reviewed(self, ident):
+        with self.lock, self.db:
+            self.db.execute('UPDATE review_queue SET reviewed_at=? WHERE title_id=?', (now(),ident))
+
+    def pending_new(self):
+        return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL)', 10000)
+
     def meta(self, key, default=None):
         with self.lock:
             row = self.db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
@@ -241,6 +257,8 @@ class Store:
                 old = self.db.execute('SELECT * FROM titles WHERE id=?', (item['id'],)).fetchone()
                 if not old:
                     new.append(item['title'])
+                    if previous:
+                        self.db.execute('INSERT OR IGNORE INTO review_queue(title_id,added_at) VALUES(?,?)', (item['id'],timestamp))
                     self.db.execute('INSERT INTO titles(id,title,type,genre,poster_date,url,seasons_count,first_seen,last_seen,status) VALUES(?,?,?,?,?,?,?,?,?,"active")', (item['id'],item['title'],item['type'],item['genre'],item['poster_date'],item['url'],str(item['seasons_count']) if item['seasons_count'] is not None else None,timestamp,timestamp))
                     self.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,?,?)', (item['id'],timestamp,'new',item['title']))
                 else:
@@ -292,6 +310,7 @@ class Analyzer:
         self.store, self.wordstat, self.transport = store, wordstat, transport
         self.top_budget, self.dynamics_budget = top_budget, dynamics_budget
         self.lock = threading.Lock()
+        self.on_synced = None
 
     def refresh(self):
         if not self.lock.acquire(blocking=False):
@@ -300,6 +319,11 @@ class Analyzer:
         try:
             items = fetch_tvoe_items(self.transport)
             stats['new'] = self.store.sync(items)
+            if self.on_synced:
+                try:
+                    self.on_synced()
+                except RuntimeError:
+                    stats['errors'].append('Telegram: уведомление о новинках ожидает повторной отправки')
             rows = self.store.rows('first_seen DESC', limit=10000)
             # Refresh never measured entries first, then stale measurements.
             rows.sort(key=lambda r: r['measured_at'] or '')
@@ -429,7 +453,7 @@ def render_list(store, kind, page):
     where = {'top':'status="active" AND total_count IS NOT NULL AND ambiguous=0',
              'growth':'status="active" AND trend="растёт" AND ambiguous=0',
              'soon':'status="active" AND poster_date IS NOT NULL',
-             'new':'status="active" AND first_seen > COALESCE((SELECT value FROM metadata WHERE key="previous_tvoe"), "9999")'}[kind]
+             'new':'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)'}[kind]
     if kind == 'soon':
         rows = sorted(store.rows('title ASC', where, 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
     else:
@@ -525,8 +549,7 @@ def dashboard_document(store, view, query, nonce, mode='date'):
     view = view if view in ('catalog','signals','new') else 'catalog'
     mode = mode if mode in ('date','top','growth') else 'date'
     all_rows = store.rows('title ASC',limit=10000)
-    previous = store.meta('previous_tvoe','')
-    new_rows = [row for row in all_rows if previous and row['first_seen'] > previous]
+    new_rows = store.new_rows()
     signal_rows = [row for row in all_rows if row['total_count'] is not None
                    and row['total_count'] > 50000 and row['trend']=='растёт'
                    and not row['ambiguous']]
@@ -571,12 +594,13 @@ def dashboard_document(store, view, query, nonce, mode='date'):
         raw_url = row['url'] or ''
         safe_link = 'https://tvoe.live' + raw_url if raw_url.startswith('/') and not raw_url.startswith('//') else ''
         heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
+        review = (f'<form action="/review" method="post"><input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button type="submit">Проверено для рекламы</button></form>' if view=='new' else '')
         entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
                        f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
-                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div></article>')
+                       f'<div class="demand">{count}<small>запросов / 30 дней</small>{review}</div></article>')
     empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
              'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
-             'new':('Новых тайтлов пока нет','Здесь появятся добавления после предыдущей проверки TVOЁ.')}
+             'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
     if query and not entries:
         empty_text = ('Ничего не найдено','Попробуйте другое название или откройте каталог.')
     else:
@@ -593,7 +617,7 @@ def dashboard_document(store, view, query, nonce, mode='date'):
     heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке'}[view]
     descriptions = {'catalog':'Один список с разными способами просмотра.',
                     'signals':'Спрос выше 50 000 и рост за последние 7 дней. Только однозначные запросы.',
-                    'new':'Добавлены после предыдущей проверки коллекции.'}
+                    'new':'Новые добавления в «Скоро в подписке». Остаются здесь до вашей проверки рекламы.'}
     controls = f'<div class="modes" aria-label="Сортировка каталога">{mode_links}</div>' if view=='catalog' else ''
     searched = escape(query,quote=True)
     form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
@@ -603,14 +627,14 @@ def dashboard_document(store, view, query, nonce, mode='date'):
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
 <body><header><div class="head"><a class="brand" href="/">TVO<span>Ё</span><small>Аналитика спроса</small></a><div class="stamp">Данные TVOЁ и Wordstat<strong>{escape(updated_text)}</strong></div></div></header>
-<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Обновляется автоматически раз в сутки</span></div></section>
+<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post"><button type="submit">↻ Обновить</button></form></div></section>
 <a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
 <nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{heading}</h2><p>{descriptions[view]}</p></div>
 <div class="controls">{controls}{form}</div>{content}
 <p class="notice">Wordstat показывает количество поисковых запросов по фразе, а не просмотры фильма. Общие названия помечены как неоднозначные. Сигнал помогает выбрать тайтл для проверки рекламной гипотезы, а не гарантирует результат кампании.</p></main></body></html>'''
 
 
-def start_dashboard(store, secret, allowed_id, port):
+def start_dashboard(store, secret, allowed_id, port, app=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass  # Avoid logging signed access links or cookie values.
@@ -637,7 +661,35 @@ def start_dashboard(store, secret, allowed_id, port):
             return 'tvoe_session' in jar and valid_access(jar['tvoe_session'].value,secret,allowed_id)
 
         def do_POST(self):
-            if urlparse(self.path).path != '/auth':
+            path = urlparse(self.path).path
+            if path in ('/refresh','/review'):
+                if not self.authorized():
+                    return self.respond(403)
+                # Same-origin POST only; no action through cross-site forms.
+                origin = self.headers.get('Origin')
+                if not origin or urlparse(origin).netloc != self.headers.get('Host') or urlparse(origin).scheme not in ('http','https'):
+                    return self.respond(403)
+                try:
+                    size = int(self.headers.get('Content-Length','0'))
+                    if size < 0 or size > 4096:
+                        return self.respond(413)
+                    fields = parse_qs(self.rfile.read(size).decode('utf-8'))
+                except (ValueError,UnicodeError):
+                    return self.respond(400)
+                if path == '/review':
+                    store.mark_reviewed(fields.get('id',[''])[0])
+                    target = '/?view=new'
+                else:
+                    if app is None:
+                        return self.respond(503)
+                    app.refresh_async()
+                    target = '/?refresh=started'
+                self.send_response(303)
+                self.send_header('Location',target)
+                self.send_header('Cache-Control','no-store')
+                self.end_headers()
+                return
+            if path != '/auth':
                 return self.respond(404)
             if int(self.headers.get('Content-Length','0')) > 4096:
                 return self.respond(413)
@@ -664,7 +716,10 @@ def start_dashboard(store, secret, allowed_id, port):
                 view = params.get('view',['catalog'])[0]
                 mode = params.get('mode',['date'])[0]
                 query = params.get('q',[''])[0][:100].strip()
-                body = dashboard_document(store,view,query,nonce,mode).encode('utf-8')
+                document = dashboard_document(store,view,query,nonce,mode)
+                if params.get('refresh') == ['started']:
+                    document = document.replace('<main>', '<main><p role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
+                body = document.encode('utf-8')
             else:
                 body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
             self.send_header('Content-Type','text/html; charset=utf-8')
@@ -685,6 +740,16 @@ def start_dashboard(store, secret, allowed_id, port):
 class BotApp:
     def __init__(self, bot, store, analyzer):
         self.bot, self.store, self.analyzer = bot, store, analyzer
+
+    def send_new_alerts(self):
+        rows = self.store.pending_new()
+        for offset in range(0,len(rows),8):
+            batch = rows[offset:offset+8]
+            message = '🆕 Новое в «Скоро в подписке» TVOЁ:\n' + '\n'.join(
+                f'{r["title"]} - {r["poster_date"] or "дата не указана"}' for r in batch)
+            self.bot.send(message + '\nСписок сохранён в разделе «Новое» до вашей проверки рекламы.', MENU)
+            with self.store.lock, self.store.db:
+                self.store.db.executemany('UPDATE review_queue SET notified_at=? WHERE title_id=?', [(now(),r['id']) for r in batch])
 
     def send_growth_alerts(self, alerts):
         for row in alerts:
@@ -713,7 +778,7 @@ class BotApp:
                 if result['errors']:
                     message += '\nОшибки: ' + '; '.join(dict.fromkeys(result['errors']))[:500]
                 self.bot.send(message, MENU)
-                self.send_growth_alerts(result['alerts'])
+            self.send_growth_alerts(result['alerts'])
         threading.Thread(target=run, daemon=True).start()
 
     def handle(self, update):
@@ -798,21 +863,30 @@ def main():
     bot = Telegram(os.environ['TELEGRAM_BOT_TOKEN'], os.environ['TELEGRAM_ALLOWED_USER_ID'])
     analyzer = Analyzer(store, Wordstat(os.environ['YANDEX_API_KEY'], os.environ['YANDEX_FOLDER_ID']), top_budget=int(os.environ.get('TOP_BUDGET','100')), dynamics_budget=int(os.environ.get('DYNAMICS_BUDGET','12')))
     app = BotApp(bot,store,analyzer)
-    start_dashboard(store,os.environ['TELEGRAM_BOT_TOKEN'],bot.allowed,int(os.environ.get('PORT','8080')))
+    analyzer.on_synced = app.send_new_alerts
+    start_dashboard(store,os.environ['TELEGRAM_BOT_TOKEN'],bot.allowed,int(os.environ.get('PORT','8080')),app)
     def schedule():
+        next_analysis = 0
         while True:
             try:
-                result = analyzer.refresh()
-                if result['new'] and store.meta('notified_once'):
-                    bot.send('🆕 Новое в TVOЁ: '+', '.join(result['new'][:10]), MENU)
-                app.send_growth_alerts(result['alerts'])
-                store.set_meta('notified_once','1')
+                if time.monotonic() >= next_analysis:
+                    result = analyzer.refresh()
+                    if not result.get('busy'):
+                        app.send_growth_alerts(result['alerts'])
+                        next_analysis = time.monotonic() + 86400
+                elif analyzer.lock.acquire(blocking=False):
+                    try:
+                        store.sync(fetch_tvoe_items(analyzer.transport))
+                        app.send_new_alerts()
+                    finally:
+                        analyzer.lock.release()
             except Exception as exc:
                 print('Scheduled refresh failed: '+type(exc).__name__, flush=True)
-            time.sleep(86400)
+            time.sleep(3600)
     threading.Thread(target=schedule,daemon=True).start()
     app.loop()
 
 
 if __name__ == '__main__':
     main()
+
