@@ -542,7 +542,8 @@ form{display:flex;gap:8px;min-width:260px}input{min-width:0;width:210px;border:1
 """
 
 
-def dashboard_document(store, view, query, nonce, mode='date'):
+def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
+    csrf_field = '<input type="hidden" name="csrf" value="' + html.escape(csrf,quote=True) + '">'
     legacy = {'soon':('catalog','date'),'top':('catalog','top'),
               'growth':('catalog','growth'),'ads':('signals','date')}
     view, mode = legacy.get(view,(view,mode))
@@ -594,7 +595,7 @@ def dashboard_document(store, view, query, nonce, mode='date'):
         raw_url = row['url'] or ''
         safe_link = 'https://tvoe.live' + raw_url if raw_url.startswith('/') and not raw_url.startswith('//') else ''
         heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
-        review = (f'<form action="/review" method="post"><input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button type="submit">Проверено для рекламы</button></form>' if view=='new' else '')
+        review = (f'<form action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button type="submit">Проверено для рекламы</button></form>' if view=='new' else '')
         entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
                        f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
                        f'<div class="demand">{count}<small>запросов / 30 дней</small>{review}</div></article>')
@@ -627,7 +628,7 @@ def dashboard_document(store, view, query, nonce, mode='date'):
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
 <body><header><div class="head"><a class="brand" href="/">TVO<span>Ё</span><small>Аналитика спроса</small></a><div class="stamp">Данные TVOЁ и Wordstat<strong>{escape(updated_text)}</strong></div></div></header>
-<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post"><button type="submit">↻ Обновить</button></form></div></section>
+<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
 <a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
 <nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{heading}</h2><p>{descriptions[view]}</p></div>
 <div class="controls">{controls}{form}</div>{content}
@@ -660,14 +661,16 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 return False
             return 'tvoe_session' in jar and valid_access(jar['tvoe_session'].value,secret,allowed_id)
 
+        def csrf_token(self):
+            jar = SimpleCookie()
+            jar.load(self.headers.get('Cookie',''))
+            session = jar['tvoe_session'].value
+            return hmac.new(secret.encode(), b'tvoe-csrf-v1:' + session.encode(), hashlib.sha256).hexdigest()
+
         def do_POST(self):
             path = urlparse(self.path).path
             if path in ('/refresh','/review'):
                 if not self.authorized():
-                    return self.respond(403)
-                # Same-origin POST only; no action through cross-site forms.
-                origin = self.headers.get('Origin')
-                if not origin or urlparse(origin).netloc != self.headers.get('Host') or urlparse(origin).scheme not in ('http','https'):
                     return self.respond(403)
                 try:
                     size = int(self.headers.get('Content-Length','0'))
@@ -676,6 +679,8 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     fields = parse_qs(self.rfile.read(size).decode('utf-8'))
                 except (ValueError,UnicodeError):
                     return self.respond(400)
+                if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
+                    return self.respond(403)
                 if path == '/review':
                     store.mark_reviewed(fields.get('id',[''])[0])
                     target = '/?view=new'
@@ -716,7 +721,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 view = params.get('view',['catalog'])[0]
                 mode = params.get('mode',['date'])[0]
                 query = params.get('q',[''])[0][:100].strip()
-                document = dashboard_document(store,view,query,nonce,mode)
+                document = dashboard_document(store,view,query,nonce,mode,self.csrf_token())
                 if params.get('refresh') == ['started']:
                     document = document.replace('<main>', '<main><p role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
                 body = document.encode('utf-8')
