@@ -241,6 +241,8 @@ class Store:
                 self.db.execute("INSERT OR IGNORE INTO review_queue(title_id,added_at,notified_at) SELECT title_id,at,at FROM events WHERE kind='new' AND at > (SELECT MIN(at) FROM events WHERE kind='new')")
                 self.set_meta('review_queue_migrated','1')
 
+            self.db.execute('CREATE TABLE IF NOT EXISTS watchlist (title_id TEXT PRIMARY KEY, name_key TEXT UNIQUE NOT NULL, added_at TEXT NOT NULL)')
+
             # Recalculate current classification from saved points, preserving history.
             for row in self.db.execute('SELECT id,dynamics_json FROM titles WHERE dynamics_json IS NOT NULL').fetchall():
                 try: direction,delta = trend(json.loads(row['dynamics_json']))
@@ -276,6 +278,36 @@ class Store:
             row = self.db.execute('SELECT status FROM ad_status WHERE title_id=?',(ident,)).fetchone()
             tests = [dict(x) for x in self.db.execute('SELECT * FROM ad_tests WHERE title_id=? ORDER BY id DESC',(ident,))]
         return (row['status'] if row else 'Рассмотреть'), tests
+
+    def add_watch(self, title='', ident=''):
+        title = ' '.join(str(title).split())
+        if not ident and (not 1 <= len(title) <= 160 or any(ord(c)<32 for c in title)):
+            raise ValueError('Введите название фильма: от 1 до 160 символов.')
+        with self.lock, self.db:
+            if ident:
+                row = self.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()
+                if not row: raise ValueError('Тайтл не найден.')
+                title = row['title']
+            key = ' '.join(re.sub(r'[^\w]+',' ',title.casefold()).split())
+            if not key: raise ValueError('Введите название фильма.')
+            existing = self.db.execute('SELECT title_id FROM watchlist WHERE name_key=?',(key,)).fetchone()
+            if existing: return existing['title_id'], False
+            if not ident:
+                matches = [r for r in self.db.execute('SELECT id,title FROM titles')
+                           if ' '.join(re.sub(r'[^\w]+',' ',r['title'].casefold()).split())==key]
+                if len(matches)==1: ident=matches[0]['id']
+                else:
+                    ident='watch:'+hashlib.sha256(key.encode()).hexdigest()[:32]
+                    stamp=now()
+                    self.db.execute('INSERT OR IGNORE INTO titles(id,title,type,first_seen,last_seen,status) VALUES(?,?,"films",?,?,"watched")',(ident,title,stamp,stamp))
+            self.db.execute('INSERT INTO watchlist VALUES(?,?,?)',(ident,key,now()))
+            return ident, True
+
+    def watch_rows(self):
+        return self.rows('title ASC','id IN (SELECT title_id FROM watchlist)',10000)
+
+    def tracking_rows(self):
+        return self.rows('title ASC','status="active" OR id IN (SELECT title_id FROM watchlist)',10000)
 
     def new_rows(self):
         return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000)
@@ -364,19 +396,34 @@ class Analyzer:
         self.lock = threading.Lock()
         self.on_synced = None
 
-    def refresh(self):
+    def refresh(self, watch_id=None):
         if not self.lock.acquire(blocking=False):
             return {'busy': True}
         stats = {'new': [], 'measured': 0, 'dynamics': 0, 'alerts': [], 'errors': []}
         try:
-            items = fetch_tvoe_items(self.transport)
-            stats['new'] = self.store.sync(items)
-            if self.on_synced:
+            if watch_id is not None:
+                day = datetime.now(UTC).date().isoformat()
+                quota_key = 'watch_checks:'+day
+                used = int(self.store.meta(quota_key,'0'))
+                if used >= self.top_budget:
+                    return stats
+                self.store.set_meta(quota_key,used+1)
+            if watch_id is None:
                 try:
-                    self.on_synced()
-                except RuntimeError:
-                    stats['errors'].append('Telegram: уведомление о новинках ожидает повторной отправки')
-            rows = self.store.rows('first_seen DESC', limit=10000)
+                    items = fetch_tvoe_items(self.transport)
+                    stats['new'] = self.store.sync(items)
+                    if self.on_synced:
+                        self.on_synced()
+                except (APIError, RuntimeError) as exc:
+                    stats['errors'].append(str(exc))
+            rows = self.store.tracking_rows()
+            if watch_id is not None:
+                rows = [r for r in rows if r['id']==watch_id]
+            def fresh(stamp):
+                try: return datetime.now(UTC)-datetime.fromisoformat(stamp) < timedelta(hours=24)
+                except (ValueError,TypeError): return False
+            # Reuse stored data for the day, including when a title is added twice.
+            rows = [r for r in rows if not fresh(r['measured_at'])]
             # Refresh never measured entries first, then stale measurements.
             rows.sort(key=lambda r: r['measured_at'] or '')
             for row in rows[:self.top_budget]:
@@ -395,9 +442,13 @@ class Analyzer:
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
                         break
-            candidates = [row for row in self.store.rows('title ASC',limit=10000)
-                          if row['total_count'] is not None and row['total_count'] > 50000
+            watched = {r['id'] for r in self.store.watch_rows()}
+            candidates = [row for row in self.store.tracking_rows()
+                          if row['total_count'] is not None and (row['total_count'] > 50000 or row['id'] in watched)
                           and not row['ambiguous'] and row['wordstat_query']]
+            candidates = [r for r in candidates if (watch_id is None or r['id']==watch_id)
+                          and not fresh(self.store.meta('dynamics_checked:'+r['id'],''))]
+            if any('HTTP 429' in e for e in stats['errors']): candidates=[]
             # Rotate through eligible titles across days, including ones not measured in this pass.
             candidates.sort(key=lambda row: (self.store.meta('dynamics_checked:'+row['id'],''),
                                              -(row['total_count'] or 0)))
@@ -409,7 +460,7 @@ class Analyzer:
                     self.store.set_meta('dynamics_error:'+row['id'],'')
                     stats['dynamics'] += 1
                     direction, delta = trend(points)
-                    if direction == 'растёт' and delta is not None and delta > 0:
+                    if row['total_count'] > 50000 and direction == 'растёт' and delta is not None and delta > 0:
                         if self.store.meta('growth_alert:'+row['id']) != 'sent':
                             stats['alerts'].append({
                                 'id':row['id'], 'title':row['title'],
@@ -423,8 +474,9 @@ class Analyzer:
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
                         break
-            checked = sum(row['total_count'] is not None for row in self.store.rows('title ASC',limit=10000))
-            if checked == len(rows) and not stats['errors']:
+            tracking = self.store.tracking_rows()
+            checked = sum(row['total_count'] is not None for row in tracking)
+            if watch_id is None and checked == len(tracking) and not stats['errors']:
                 self.store.set_meta('last_full',now())
             self.store.set_meta('last_errors', ', '.join(dict.fromkeys(stats['errors']))[:500])
             return stats
@@ -643,15 +695,19 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     legacy = {'soon':('catalog','date'),'top':('catalog','top'),
               'growth':('catalog','growth'),'ads':('signals','date')}
     view, mode = legacy.get(view,(view,mode))
-    view = view if view in ('catalog','signals','new') else 'catalog'
+    view = view if view in ('catalog','signals','new','watch') else 'catalog'
     mode = mode if mode in ('date','top','growth') else 'date'
     all_rows = store.rows('title ASC',limit=10000)
     new_rows = store.new_rows()
-    signal_rows = [row for row in all_rows if row['total_count'] is not None
+    watch_rows = store.watch_rows()
+    watch_ids = {r['id'] for r in watch_rows}
+    signal_rows = [row for row in store.tracking_rows() if row['total_count'] is not None
                    and row['total_count'] > 50000 and row['trend']=='растёт'
                    and not row['ambiguous']]
     if view == 'signals':
         rows = sorted(signal_rows,key=lambda r:r['delta'] or 0,reverse=True)
+    elif view == 'watch':
+        rows = watch_rows
     elif view == 'new':
         rows = sorted(new_rows,key=lambda r:r['first_seen'],reverse=True)
     elif mode == 'top':
@@ -666,7 +722,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         rows = [row for row in rows if query.casefold() in row['title'].casefold()]
     escape = html.escape
     tabs = [('catalog','Каталог',len(all_rows)),('signals','Сигналы',len(signal_rows)),
-            ('new','Новое',len(new_rows))]
+            ('new','Новое',len(new_rows)),('watch','Отслеживаемые фильмы',len(watch_rows))]
     links = ''.join(f'<a class="tab{" active" if view==key else ""}" href="/?view={key}"'
                     f'{" aria-current=page" if view==key else ""}>{label} · {count}</a>'
                     for key,label,count in tabs)
@@ -681,7 +737,7 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         if row['id'] in seen:
             continue
         seen.add(row['id'])
-        date_label = escape(str(row['poster_date'] or 'Дата не указана'))
+        date_label = ('Добавлен вручную' if row['status']=='watched' else ('Нет в текущем каталоге TVOЁ' if row['status']=='removed' else escape(str(row['poster_date'] or 'Дата не указана'))))
         title = escape(row['title'])
         kind = {'serials':'Сериал','films':'Фильм'}.get(row['type'],str(row['type'] or 'Тип не указан'))
         detail = escape(kind) + (' · запрос неоднозначен' if row['ambiguous'] else '')
@@ -693,11 +749,14 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
         heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
         analysis = title_analysis(store,row,csrf_field)
         review = (f'<form class="review-action" action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit" title="Убрать из нового: проверка рекламы завершена" aria-label="Проверено для рекламы">✓ Проверено</button></form>' if view=='new' else '')
+        follow = (f'<span class="detail">Отслеживается</span>' if row['id'] in watch_ids else
+                  f'<form class="review-action" action="/watch" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit">Следить</button></form>')
         entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
                        f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
-                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}{analysis}</article>')
+                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}{follow}{analysis}</article>')
     empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
              'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
+             'watch':('Пока нет отслеживаемых фильмов','Введите название выше или нажмите «Следить» у тайтла в каталоге.'),
              'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
     if query and not entries:
         empty_text = ('Ничего не найдено','Попробуйте другое название или откройте каталог.')
@@ -712,20 +771,26 @@ def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
     except ValueError:
         updated_text = 'ожидается первое обновление'
     checked = sum(row['total_count'] is not None for row in all_rows)
-    heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке'}[view]
+    heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке','watch':'Отслеживаемые фильмы'}[view]
     descriptions = {'catalog':'Один список с разными способами просмотра.',
                     'signals':'Спрос выше 50 000 и рост за последние 7 дней. Только однозначные запросы.',
+                    'watch':'Любые фильмы, даже вне каталога TVOЁ. Wordstat проверяется при добавлении и затем раз в сутки в пределах лимитов.',
                     'new':'Добавления остаются здесь до отметки «Проверено». Рост спроса отслеживается и после проверки.'}
     controls = f'<div class="modes" aria-label="Сортировка каталога">{mode_links}</div>' if view=='catalog' else ''
     searched = escape(query,quote=True)
     form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
             + (f'<input type="hidden" name="mode" value="{mode}">' if view=='catalog' else '')
             + f'<input type="search" name="q" value="{searched}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button type="submit">Найти</button></form>')
+    if view=='watch':
+        controls = (f'<form class="watch-add" action="/watch" method="post">{csrf_field}'
+                    '<label for="watch-title">Добавить фильм</label>'
+                    '<input id="watch-title" name="title" maxlength="160" required placeholder="Название фильма" aria-label="Название фильма">'
+                    '<button type="submit">Следить</button></form>')
     errors = store.meta('last_errors','')
     error_notice = '<p class="notice">Часть данных не обновилась. Показаны последние сохранённые значения.</p>' if errors else ''
     summary = ('<strong>' + (f'{len(signal_rows)} сигналов для проверки рекламы' if signal_rows else 'Сигналов для рекламы пока нет') + '</strong>'
                '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head>
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}.watch-add{{display:flex;flex-wrap:wrap;gap:8px;width:100%}}.watch-add label{{flex-basis:100%}}.watch-add input{{flex:1;min-width:120px;width:auto}}.watch-add button{{flex-shrink:0}}@media(max-width:700px){{nav{{flex-wrap:wrap;gap:4px 18px}}}}</style></head>
 <body><header><div class="head"><a class="brand" href="/">TVO<span>Ё</span><small>Аналитика спроса</small></a><div class="stamp">Данные TVOЁ и Wordstat<strong>{escape(updated_text)}</strong></div></div></header>
 <main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
 <a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
@@ -768,7 +833,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review','/ad'):
+            if path in ('/refresh','/review','/ad','/watch'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
@@ -786,6 +851,14 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     except (ValueError,OverflowError):
                         return self.respond(400,'Некорректные данные. Проверьте период и неотрицательные показатели; вернитесь назад.'.encode())
                     target = '/'
+                elif path == '/watch':
+                    try:
+                        ident, added = store.add_watch(fields.get('title',[''])[0], fields.get('id',[''])[0])
+                    except ValueError as exc:
+                        return self.respond(400,html.escape(str(exc)).encode())
+                    if app is not None and added:
+                        app.refresh_async(notify=False,watch_id=ident)
+                    target = '/?view=watch&watch=saved'
                 elif path == '/review':
                     store.mark_reviewed(fields.get('id',[''])[0])
                     target = '/?view=new'
@@ -827,11 +900,13 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 mode = params.get('mode',['date'])[0]
                 query = params.get('q',[''])[0][:100].strip()
                 document = dashboard_document(store,view,query,nonce,mode,self.csrf_token())
+                if params.get('watch') == ['saved']:
+                    document = document.replace('<main>', '<main><p role="status">Фильм сохранён. Проверка Wordstat выполняется в фоне в пределах лимитов. Обновите страницу через некоторое время, чтобы увидеть результат.</p>', 1)
                 if params.get('refresh') == ['started']:
                     document = document.replace('<main>', '<main><p role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
                 body = document.encode('utf-8')
             else:
-                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
+                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}.watch-add{{display:flex;flex-wrap:wrap;gap:8px;width:100%}}.watch-add label{{flex-basis:100%}}.watch-add input{{flex:1;min-width:120px;width:auto}}.watch-add button{{flex-shrink:0}}@media(max-width:700px){{nav{{flex-wrap:wrap;gap:4px 18px}}}}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
             self.send_header('Content-Type','text/html; charset=utf-8')
             self.send_header('Content-Length',str(len(body)))
             self.send_header('Cache-Control','no-store')
@@ -873,15 +948,19 @@ class BotApp:
             self.bot.send(message,MENU)
             self.store.set_meta('growth_alert:'+row['id'],'sent')
 
-    def refresh_async(self, notify=True):
-        if self.analyzer.lock.locked():
-            self.bot.send('Обновление уже выполняется.')
+    def refresh_async(self, notify=True, watch_id=None):
+        if watch_id is None and self.analyzer.lock.locked():
+            if notify: self.bot.send('Обновление уже выполняется.')
             return
-        self.bot.send('🔄 Обновление запущено.')
+        if notify: self.bot.send('🔄 Обновление запущено.')
         def run():
-            result = self.analyzer.refresh()
+            # A manual addition waits behind an in-flight refresh instead of being lost.
+            while True:
+                result = self.analyzer.refresh(watch_id=watch_id)
+                if watch_id is None or not result.get('busy'): break
+                time.sleep(1)
             if result.get('busy'):
-                self.bot.send('Обновление уже выполняется.')
+                if notify: self.bot.send('Обновление уже выполняется.')
                 return
             if notify:
                 message = f'Обновление завершено. Новых: {len(result["new"])}; Wordstat: {result["measured"]}; динамика: {result["dynamics"]}.'
@@ -999,5 +1078,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
