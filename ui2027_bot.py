@@ -313,14 +313,14 @@ class Store:
         return all_tracking(self)
 
     def new_rows(self):
-        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000) if detail_for(self,r)['availability']=='available']
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if detail_for(self,r)['availability']=='available' and not self.meta('feed_baseline:'+r['id'],'')]
 
     def mark_reviewed(self, ident):
         with self.lock, self.db:
             self.db.execute('UPDATE review_queue SET reviewed_at=? WHERE title_id=?', (now(),ident))
 
     def pending_new(self):
-        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL)', 10000) if detail_for(self,r)['availability']=='available']
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if detail_for(self,r)['availability']=='available']
 
     def meta(self, key, default=None):
         with self.lock:
@@ -482,6 +482,7 @@ def set_availability(store, ident, state, evidence='Подтверждено п�
         store.db.execute('INSERT INTO film_details(title_id,availability,available_at,evidence,year,poster,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET availability=excluded.availability,available_at=excluded.available_at,evidence=excluded.evidence,year=CASE WHEN excluded.year!="" THEN excluded.year ELSE film_details.year END,poster=CASE WHEN excluded.poster!="" THEN excluded.poster ELSE film_details.poster END,updated_at=excluded.updated_at',
                          (ident,state,available_at or (stamp if state=='available' else ''),evidence,year,safe_url(poster),stamp))
         if state=='available' and old!='available':
+            store.set_meta('feed_baseline:'+ident,'')
             store.db.execute('INSERT INTO review_queue(title_id,added_at,reviewed_at,notified_at) VALUES(?,?,NULL,NULL) ON CONFLICT(title_id) DO UPDATE SET added_at=excluded.added_at,reviewed_at=NULL,notified_at=NULL',(ident,stamp))
             store.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,"published",?)',(ident,stamp,evidence))
 
@@ -519,17 +520,44 @@ def signal_fresh(store, row, comparison=None):
     except (ValueError,TypeError,KeyError): return False
 
 
+def fresh_demand(store,row):
+    try:
+        age=datetime.now(UTC)-datetime.fromisoformat(row['measured_at'])
+        return timedelta(0)<=age<=timedelta(days=3) and not row['ambiguous'] and not store.meta('top_error:'+row['id'],'')
+    except (ValueError,TypeError,KeyError):return False
+
+
+def radar_tracked_ids(store):
+    with store.lock:
+        return {r[0] for r in store.db.execute('SELECT COALESCE(confirmed_id,match_id) FROM radar_items WHERE dismissed=0 AND COALESCE(confirmed_id,match_id) IS NOT NULL')}
+
+
 def growth_rows(store, early=False):
-    rows=[]
+    rows=[];promoted={r['id'] for r in promotion_rows(store)};radar=radar_tracked_ids(store)
     for row in all_tracking(store):
-        c=demand_comparison(row)
-        if row['ambiguous'] or not c or not signal_fresh(store,row,c) or row['trend']!='растёт': continue
-        n=row['total_count'] or 0
+        if row['id'] in promoted or not fresh_demand(store,row):continue
+        c=demand_comparison(row);n=row['total_count'] or 0
+        growing=bool(c and signal_fresh(store,row,c) and row['trend']=='растёт' and not store.meta('dynamics_error:'+row['id'],''))
         if early:
-            # Percentage alone over tiny values does not make a useful early signal.
-            if 1000<=n<=50000 and c['older']>=100 and c['delta']>=100: rows.append(row)
-        elif n>50000: rows.append(row)
-    return sorted(rows,key=lambda r:r['delta'] or 0,reverse=True)
+            if growing and 1000<=n<=50000 and c['older']>=100 and c['delta']>=100:rows.append(row)
+        elif n>50000 and (growing or row['id'] in radar):rows.append(row)
+    return sorted(rows,key=lambda r:(r['delta'] or 0,r['total_count'] or 0),reverse=True)
+
+
+def growth_alert_rows(store):
+    promoted={r['id'] for r in promotion_rows(store)};radar=radar_tracked_ids(store);result=[]
+    for row in all_tracking(store):
+        if row['id'] in promoted or not fresh_demand(store,row):continue
+        c=demand_comparison(row)
+        growing=bool(c and signal_fresh(store,row,c) and row['trend']=='растёт' and c['percent'] is not None and not store.meta('dynamics_error:'+row['id'],''))
+        if growing or (row['id'] in radar and (row['total_count'] or 0)>50000):result.append(row)
+    return result
+
+
+def confirmed_decline(store,row):
+    c=demand_comparison(row)
+    with store.lock:state=store.db.execute('SELECT * FROM decline_state WHERE title_id=?',(row['id'],)).fetchone()
+    return bool(state and state['confirmations']>=2 and c and c['percent'] is not None and c['percent']<=-30 and signal_fresh(store,row,c) and not row['ambiguous'] and not store.meta('dynamics_error:'+row['id'],''))
 
 
 def evaluate_decline(store, row):
@@ -791,6 +819,7 @@ def import_catalog_feed(store,raw):
             if baseline and before!='available':
                 # First full catalog establishes a baseline, not a mass new-title alert.
                 store.db.execute('UPDATE review_queue SET reviewed_at=?,notified_at=? WHERE title_id=?',(stamp,stamp,item['id']))
+                store.set_meta('feed_baseline:'+item['id'],'1')
         store.set_meta('catalog_feed_updated',stamp)
     return len(items)
 
@@ -853,13 +882,6 @@ class Analyzer:
             return {'busy': True}
         stats = {'new': [], 'measured': 0, 'dynamics': 0, 'alerts': [], 'errors': []}
         try:
-            if watch_id is not None:
-                day = datetime.now(UTC).date().isoformat()
-                quota_key = 'watch_checks:'+day
-                used = int(self.store.meta(quota_key,'0'))
-                if used >= self.top_budget:
-                    return stats
-                self.store.set_meta(quota_key,used+1)
             if watch_id is None:
                 auto_track_radar(self.store)
                 try:
@@ -884,7 +906,12 @@ class Analyzer:
             # Refresh never measured entries first, then stale measurements.
             promoted={r['id'] for r in promotion_rows(self.store)}
             rows.sort(key=lambda r: (r['id'] not in promoted,r['measured_at'] or ''))
-            for row in rows[:self.top_budget]:
+            day=datetime.now(UTC).date().isoformat()
+            top_key='daily_top:'+day
+            top_remaining=max(0,self.top_budget-int(self.store.meta(top_key,'0')))
+            self.store.set_meta('wordstat_top_queue',str(max(0,len(rows)-top_remaining)))
+            for row in rows[:top_remaining]:
+                self.store.set_meta(top_key,str(int(self.store.meta(top_key,'0'))+1))
                 try:
                     override = detail_for(self.store,row).get('query_override')
                     initial = self.wordstat.top(override or row['title'])
@@ -893,7 +920,7 @@ class Analyzer:
                     count = int(top['totalCount'])
                     self.store.measured(row['id'],query,note,ambiguous,count,None)
                     if count <= 50000:
-                        self.store.set_meta('growth_alert:'+row['id'],'quiet')
+                        self.store.set_meta('radar_alert:'+row['id'],'quiet')
                     self.store.set_meta('top_error:'+row['id'],'')
                     stats['measured'] += 1
                 except APIError as exc:
@@ -904,14 +931,21 @@ class Analyzer:
                         break
             watched = {r['id'] for r in self.store.watch_rows()}
             candidates = [row for row in self.store.tracking_rows()
-                          if row['total_count'] is not None and (row['total_count']>=1000 or row['id'] in promoted or row['id'] in watched) and not row['ambiguous'] and row['wordstat_query']]
+                          if row['total_count'] is not None and not row['ambiguous'] and row['wordstat_query']]
             candidates = [r for r in candidates if (watch_id is None or r['id']==watch_id)
                           and not fresh(self.store.meta('dynamics_checked:'+r['id'],''))]
             if any('HTTP 429' in e for e in stats['errors']) or self.store.meta('wordstat_retry_at','')>now(): candidates=[]
             # Rotate through eligible titles across days, including ones not measured in this pass.
-            candidates.sort(key=lambda row: (row['id'] not in promoted,(row['total_count'] or 0)<=50000,self.store.meta('dynamics_checked:'+row['id'],''),
+            def overdue(row):
+                try:return datetime.now(UTC)-datetime.fromisoformat(self.store.meta('dynamics_checked:'+row['id'],''))>=timedelta(days=6)
+                except (ValueError,TypeError):return True
+            candidates.sort(key=lambda row: (not overdue(row),row['id'] not in promoted,(row['total_count'] or 0)<=50000,self.store.meta('dynamics_checked:'+row['id'],''),
                                              -(row['total_count'] or 0)))
-            for row in candidates[:self.dynamics_budget]:
+            dyn_key='daily_dynamics:'+day
+            dyn_remaining=max(0,self.dynamics_budget-int(self.store.meta(dyn_key,'0')))
+            self.store.set_meta('wordstat_dynamics_queue',str(max(0,len(candidates)-dyn_remaining)))
+            for row in candidates[:dyn_remaining]:
+                self.store.set_meta(dyn_key,str(int(self.store.meta(dyn_key,'0'))+1))
                 try:
                     points = self.wordstat.dynamics(row['wordstat_query'])
                     self.store.attach_dynamics(row['id'],points)
@@ -919,14 +953,7 @@ class Analyzer:
                     self.store.set_meta('dynamics_error:'+row['id'],'')
                     stats['dynamics'] += 1
                     direction, delta = trend(points)
-                    if row['total_count'] > 50000 and direction == 'растёт' and delta is not None and delta > 0 and signal_fresh(self.store,{**row,'dynamics_json':json.dumps(points)}):
-                        if self.store.meta('growth_alert:'+row['id']) != 'sent':
-                            stats['alerts'].append({
-                                'id':row['id'], 'title':row['title'],
-                                'count':row['total_count'], 'delta':delta,
-                                'query':row['wordstat_query']
-                            })
-                    elif direction in ('стабильно','падает'):
+                    if direction in ('стабильно','падает'):
                         self.store.set_meta('growth_alert:'+row['id'],'quiet')
                 except APIError as exc:
                     self.store.set_meta('dynamics_error:'+row['id'],now()+' | '+str(exc))
@@ -1026,10 +1053,14 @@ def render_list(store, kind, page):
              'growth':'status="active" AND trend="растёт" AND ambiguous=0',
              'soon':'status="active" AND poster_date IS NOT NULL',
              'new':'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL) AND id IN (SELECT title_id FROM film_details WHERE availability="available")'}[kind]
-    if kind == 'soon':
-        rows = sorted(store.rows('title ASC', where, 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
+    if kind=='growth':
+        rows=growth_rows(store)[page*5:(page+1)*5]
+    elif kind=='new':
+        rows=store.new_rows()[page*5:(page+1)*5]
+    elif kind == 'soon':
+        rows = sorted(store.rows('title ASC', where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
     else:
-        rows = store.rows(order, where, 5, page*5)
+        rows = store.rows(order, where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 5, page*5)
     labels = {'top':'🔥 Популярное','growth':'📈 Растущий спрос','soon':'📅 Скоро в подписке','new':'🆕 Новые тайтлы'}
     text = labels[kind] + f' - страница {page+1}\n\n' + ('\n\n'.join(item_text(row, page*5+i+1) for i,row in enumerate(rows)) if rows else 'Пока нет данных.')
     buttons = []
@@ -1130,7 +1161,7 @@ def title_analysis(store, row, csrf_field):
 
 
 DASHBOARD_CSS = '''
-:root{--bg:#f7f8f6;--white:#fff;--ink:#172421;--muted:#69746e;--line:#dfe5df;--green:#125b43;--soft:#e9f5ed;--warn:#fff2df;--red:#9a403d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green)}button,input,select{font:inherit}button,.button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 16px;border-radius:10px;border:1px solid var(--green);background:var(--green);color:white;font-weight:650;text-decoration:none;text-align:center}button.secondary,.button.secondary{background:white;color:var(--ink);border-color:var(--line)}button:hover,.button:hover{filter:brightness(.94)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79b49a;outline-offset:3px}input,select{border:1px solid #cbd5cc;border-radius:9px;background:#fff;color:var(--ink);padding:10px 12px;min-height:44px;min-width:0;max-width:100%}form{margin:0}.head{max-width:1200px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:28px 24px 18px}.brand{font-size:30px;letter-spacing:-1px;font-weight:800;text-decoration:none;color:var(--ink)}.brand small{font-size:16px;font-weight:500;letter-spacing:0;color:var(--muted);display:block}.stamp{font-size:12px;color:var(--muted);text-align:right}.stamp strong{display:block;color:var(--ink);font-size:13px}main{max-width:1200px;margin:auto;padding:0 24px 56px}.hero{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:12px 0 22px}.hero h1{font-size:30px;letter-spacing:-.8px;line-height:1.18;margin:0 0 5px}.hero p,.section-head p{margin:0;color:var(--muted)}.hero-facts{display:flex;gap:10px;align-items:center}.hero-facts>span{font-size:12px;color:var(--muted);max-width:160px}nav{display:flex;gap:6px;background:white;border:1px solid var(--line);border-radius:13px;padding:7px;margin-bottom:24px}.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 8px;border-radius:9px;text-decoration:none;color:var(--ink);white-space:nowrap;font-weight:600}.tab.active{background:var(--green);color:#fff}.tab small{font-size:11px;opacity:.7}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:18px}.section-head h2{font-size:23px;margin:0;letter-spacing:-.5px}.section-head p{max-width:540px;font-size:13px}.controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}.controls form{display:flex;gap:8px}.controls input[type=search]{width:230px}.modes{display:flex;flex-wrap:wrap;gap:7px}.mode{display:block;padding:8px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px}.mode.active{background:var(--green);color:white;border-color:var(--green)}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.entry{border:1px solid var(--line);border-radius:15px;background:#fff;padding:20px;min-width:0}.card-top{display:grid;grid-template-columns:80px minmax(0,1fr);gap:16px}.poster{width:80px;height:112px;border-radius:9px;object-fit:cover;background:#ecf0eb}.poster-placeholder{display:flex;align-items:center;justify-content:center;color:var(--green);font-size:32px;font-weight:700}.title{font-size:19px;line-height:1.3;margin:0 0 7px;overflow-wrap:anywhere}.title a{text-decoration:none;color:var(--ink)}.detail{font-size:12px;color:var(--muted);margin-bottom:9px;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:4px 8px;font-size:12px;font-weight:600;margin:2px 4px 6px 0;background:#edf0ed;color:var(--muted)}.badge.available{background:#dff3e5;color:var(--green)}.badge.soon,.badge.warn{background:var(--warn);color:#87551d}.badge.fall{background:#fbe9e7;color:var(--red)}.demand{font-weight:750;font-size:21px;line-height:1.4}.demand small{font-size:12px;font-weight:400;color:var(--muted)}.trend{color:var(--green);font-size:15px;font-weight:700}.fall-text{color:var(--red)}.spark{display:block;width:100%;height:68px;margin:12px 0 4px;color:var(--green)}.spark.falling{color:var(--red)}.data-date{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions form{display:inline-flex}.actions button,.actions .button{font-size:12px;padding:9px 12px}.analysis{margin-top:13px;border-top:1px solid var(--line);padding-top:10px;font-size:12px;overflow-wrap:anywhere}.analysis summary{cursor:pointer;color:var(--muted);min-height:34px;padding:5px 0}.analysis p{color:var(--muted)}.analysis .data-error{color:var(--red)}.demand-chart{width:100%;height:120px;color:var(--green)}.edit-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.edit-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.edit-form .wide{grid-column:1/-1}.edit-form input,.edit-form select{width:100%}.edit-form button{justify-self:start}.watch-add{width:100%;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff;display:flex;gap:8px;flex-wrap:wrap}.watch-add label{width:100%;font-size:13px;font-weight:600}.watch-add input{flex:1;width:auto;min-width:120px}.empty{padding:32px;border:1px dashed var(--line);border-radius:12px;grid-column:1/-1;color:var(--muted);background:#fff}.empty strong{display:block;margin-bottom:6px;color:var(--ink)}.notice{font-size:12px;line-height:1.6;color:var(--muted);margin:18px 0}.status-notice{background:#fff8e9;border:1px solid #e6d8ba;border-radius:10px;padding:12px 16px}.source-list{margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;font-size:12px}.source-list summary{font-weight:600;cursor:pointer;min-height:30px}.source-row{display:flex;justify-content:space-between;align-items:start;gap:16px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px}.source-row span{color:var(--muted);text-align:right}.radar-card .title{font-size:18px}.radar-card .reason{color:var(--green);margin:8px 0}.lock{max-width:520px;margin:12vh auto;padding:28px}.lock h1{font-size:26px}.health-line{font-size:12px;color:var(--muted);margin-top:24px}.danger{color:var(--red)!important}.pagination{display:flex;gap:9px;justify-content:center;margin-top:20px}@media(max-width:760px){.head{padding:20px 16px 12px;align-items:start}.brand{font-size:25px}.brand small{font-size:12px}.stamp{font-size:10px;max-width:125px}.stamp strong{font-size:11px}main{padding:0 16px 40px}.hero{display:block;margin-top:14px}.hero h1{font-size:26px}.hero p{font-size:13px}.hero-facts{margin-top:14px}.hero-facts>span{max-width:none}nav{flex-wrap:wrap;gap:4px;padding:5px}.tab{flex:1 0 28%;padding:10px 5px;font-size:12px}.section-head{display:block}.section-head p{margin-top:6px}.controls{display:block}.controls>form{margin-top:12px;width:100%}.controls input[type=search]{width:auto;flex:1}.modes{margin-bottom:12px}.list{grid-template-columns:1fr}.entry{padding:16px}.card-top{grid-template-columns:68px minmax(0,1fr);gap:12px}.poster{width:68px;height:96px}.title{font-size:17px}.demand{font-size:19px}.actions{gap:7px}.source-row{display:block}.source-row span{display:block;text-align:left;margin-top:3px}.watch-add input{flex-basis:55%}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+:root{--bg:#f7f8f6;--white:#fff;--ink:#172421;--muted:#69746e;--line:#dfe5df;--green:#125b43;--soft:#e9f5ed;--warn:#fff2df;--red:#9a403d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green)}button,input,select{font:inherit}button,.button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 16px;border-radius:10px;border:1px solid var(--green);background:var(--green);color:white;font-weight:650;text-decoration:none;text-align:center}button.secondary,.button.secondary{background:white;color:var(--ink);border-color:var(--line)}button:hover,.button:hover{filter:brightness(.94)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79b49a;outline-offset:3px}input,select{border:1px solid #cbd5cc;border-radius:9px;background:#fff;color:var(--ink);padding:10px 12px;min-height:44px;min-width:0;max-width:100%}form{margin:0}.head{max-width:1200px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:28px 24px 18px}.brand{font-size:30px;letter-spacing:-1px;font-weight:800;text-decoration:none;color:var(--ink)}.brand small{font-size:16px;font-weight:500;letter-spacing:0;color:var(--muted);display:block}.stamp{font-size:12px;color:var(--muted);text-align:right}.stamp strong{display:block;color:var(--ink);font-size:13px}main{max-width:1200px;margin:auto;padding:0 24px 56px}.hero{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:12px 0 22px}.hero h1{font-size:30px;letter-spacing:-.8px;line-height:1.18;margin:0 0 5px}.hero p,.section-head p{margin:0;color:var(--muted)}.hero-facts{display:flex;gap:10px;align-items:center}.hero-facts>span{font-size:12px;color:var(--muted);max-width:160px}nav{display:flex;gap:6px;background:white;border:1px solid var(--line);border-radius:13px;padding:7px;margin-bottom:24px}.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 8px;border-radius:9px;text-decoration:none;color:var(--ink);white-space:nowrap;font-weight:600}.tab.active{background:var(--green);color:#fff}.tab small{font-size:11px;opacity:.7}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:18px}.section-head h2{font-size:23px;margin:0;letter-spacing:-.5px}.section-head p{max-width:540px;font-size:13px}.controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}.controls form{display:flex;gap:8px}.controls input[type=search]{width:230px}.modes{display:flex;flex-wrap:wrap;gap:7px}.mode{display:block;padding:8px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px}.mode.active{background:var(--green);color:white;border-color:var(--green)}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.entry{border:1px solid var(--line);border-radius:15px;background:#fff;padding:20px;min-width:0}.card-top{display:grid;grid-template-columns:80px minmax(0,1fr);gap:16px}.poster{width:80px;height:112px;border-radius:9px;object-fit:cover;background:#ecf0eb}.poster-placeholder{display:flex;align-items:center;justify-content:center;color:var(--green);font-size:32px;font-weight:700}.title{font-size:19px;line-height:1.3;margin:0 0 7px;overflow-wrap:anywhere}.title a{text-decoration:none;color:var(--ink)}.detail{font-size:12px;color:var(--muted);margin-bottom:9px;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:4px 8px;font-size:12px;font-weight:600;margin:2px 4px 6px 0;background:#edf0ed;color:var(--muted)}.badge.available{background:#dff3e5;color:var(--green)}.badge.soon,.badge.warn{background:var(--warn);color:#87551d}.decline-card{border:2px solid var(--red);background:#fff5f4}.badge.fall{background:#fbe9e7;color:var(--red)}.demand{font-weight:750;font-size:21px;line-height:1.4}.demand small{font-size:12px;font-weight:400;color:var(--muted)}.trend{color:var(--green);font-size:15px;font-weight:700}.fall-text{color:var(--red)}.spark{display:block;width:100%;height:68px;margin:12px 0 4px;color:var(--green)}.spark.falling{color:var(--red)}.data-date{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions form{display:inline-flex}.actions button,.actions .button{font-size:12px;padding:9px 12px}.analysis{margin-top:13px;border-top:1px solid var(--line);padding-top:10px;font-size:12px;overflow-wrap:anywhere}.analysis summary{cursor:pointer;color:var(--muted);min-height:34px;padding:5px 0}.analysis p{color:var(--muted)}.analysis .data-error{color:var(--red)}.demand-chart{width:100%;height:120px;color:var(--green)}.edit-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.edit-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.edit-form .wide{grid-column:1/-1}.edit-form input,.edit-form select{width:100%}.edit-form button{justify-self:start}.watch-add{width:100%;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff;display:flex;gap:8px;flex-wrap:wrap}.watch-add label{width:100%;font-size:13px;font-weight:600}.watch-add input{flex:1;width:auto;min-width:120px}.empty{padding:32px;border:1px dashed var(--line);border-radius:12px;grid-column:1/-1;color:var(--muted);background:#fff}.empty strong{display:block;margin-bottom:6px;color:var(--ink)}.notice{font-size:12px;line-height:1.6;color:var(--muted);margin:18px 0}.status-notice{background:#fff8e9;border:1px solid #e6d8ba;border-radius:10px;padding:12px 16px}.source-list{margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;font-size:12px}.source-list summary{font-weight:600;cursor:pointer;min-height:30px}.source-row{display:flex;justify-content:space-between;align-items:start;gap:16px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px}.source-row span{color:var(--muted);text-align:right}.radar-card .title{font-size:18px}.radar-card .reason{color:var(--green);margin:8px 0}.lock{max-width:520px;margin:12vh auto;padding:28px}.lock h1{font-size:26px}.health-line{font-size:12px;color:var(--muted);margin-top:24px}.danger{color:var(--red)!important}.pagination{display:flex;gap:9px;justify-content:center;margin-top:20px}@media(max-width:760px){.head{padding:20px 16px 12px;align-items:start}.brand{font-size:25px}.brand small{font-size:12px}.stamp{font-size:10px;max-width:125px}.stamp strong{font-size:11px}main{padding:0 16px 40px}.hero{display:block;margin-top:14px}.hero h1{font-size:26px}.hero p{font-size:13px}.hero-facts{margin-top:14px}.hero-facts>span{max-width:none}nav{flex-wrap:wrap;gap:4px;padding:5px}.tab{flex:1 0 28%;padding:10px 5px;font-size:12px}.section-head{display:block}.section-head p{margin-top:6px}.controls{display:block}.controls>form{margin-top:12px;width:100%}.controls input[type=search]{width:auto;flex:1}.modes{margin-bottom:12px}.list{grid-template-columns:1fr}.entry{padding:16px}.card-top{grid-template-columns:68px minmax(0,1fr);gap:12px}.poster{width:68px;height:96px}.title{font-size:17px}.demand{font-size:19px}.actions{gap:7px}.source-row{display:block}.source-row span{display:block;text-align:left;margin-top:3px}.watch-add input{flex-basis:55%}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 '''
 
 
@@ -1191,9 +1222,10 @@ def film_card(store,row,view,csrf,watched,promoted):
     elif view=='watch':controls+=action_form('/unwatch',csrf,{'id':row['id']},'Убрать из списка',True)
     if row['id'] not in promoted:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'1'},'В рекламу')
     else:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'0'},'Убрать из рекламы',True)
-    if view=='new':controls+=action_form('/review',csrf,{'id':row['id']},'✓ Проверено',True)
-    if view=='ads' and c and c['percent'] is not None and c['percent']<=-30 and is_fresh:
-        controls+='<span class="badge fall">Спрос падает · проверьте кампанию</span>'
+    # New titles stay in the queue until moved to advertising.
+    declining=view=='ads' and confirmed_decline(store,row)
+    if declining:
+        controls+='<span class="badge fall">Подтверждённый спад · рассмотреть снятие с рекламы</span>'
     edit=(f'<details class="analysis"><summary>Уточнить фильм и доступность</summary><form class="edit-form" action="/film" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}"><input type="hidden" name="return" value="{view}">'
           f'<label>Тип<select name="type" aria-label="Тип"><option value="films" {"selected" if kind=="Фильм" else ""}>Фильм</option><option value="serials" {"selected" if kind=="Сериал" else ""}>Сериал</option></select></label>'
           f'<label>Год<input name="year" inputmode="numeric" maxlength="4" value="{esc(d.get("year") or "",quote=True)}" placeholder="Например, 2026"></label>'
@@ -1201,7 +1233,7 @@ def film_card(store,row,view,csrf,watched,promoted):
           f'<label class="wide">Подтверждённый запрос Wordstat<input name="query" maxlength="180" value="{esc(d.get("query_override") or "",quote=True)}" placeholder="Название + фильм / сериал / год"></label>'
           '<p class="notice wide">Подтверждайте доступность после проверки карточки TVOЁ. Уточнение запроса сохраняет старую историю отдельно.</p><button type="submit">Сохранить</button></form></details>')
     date_info=(f'Последние данные · {short_date(c["to"])} · два полных периода по 7 дней' if c else 'Динамика ещё не получена')
-    return (f'<article class="entry"><div class="card-top">{picture}<div><h3 class="title">{heading}</h3><div class="detail">{esc(subtitle)}</div>{badges}<div class="demand">{count}<small>{" запросов / 30 дней" if row["total_count"] is not None else ""}</small>{change}</div><div class="detail">Wordstat проверен · {esc(short_date(row["measured_at"]))}</div></div></div>'
+    return (f'<article class="entry {"decline-card" if declining else ""}"><div class="card-top">{picture}<div><h3 class="title">{heading}</h3><div class="detail">{esc(subtitle)}</div>{badges}<div class="demand">{count}<small>{" запросов / 30 дней" if row["total_count"] is not None else ""}</small>{change}</div><div class="detail">Wordstat проверен · {esc(short_date(row["measured_at"]))}</div></div></div>'
             +sparkline(row)+f'<div class="data-date">{esc(date_info)}</div><div class="actions">{controls}</div>'+title_analysis(store,row,csrf)+edit+'</article>')
 
 
@@ -1214,13 +1246,23 @@ def source_status(store):
     return '<details class="source-list" open><summary>Источники и обновление</summary>'+''.join(rows)+'</details>'
 
 
-def radar_card(row,csrf):
+def radar_card(store,row,csrf):
     esc=html.escape
     confirmed=row.get('confirmed_id')
     state=('Название отслеживается · спрос проверяет Wordstat' if confirmed else 'Название найдено в каталоге · проверьте совпадение' if row.get('match_id') else 'Совпадение требует проверки')
+    film_id=confirmed or row.get('match_id')
+    fields={'active':'1','radar_id':row['id']}
+    fields.update({'id':film_id} if film_id else {'title':row['title']})
+    promote=action_form('/promotion',csrf,fields,'В рекламу')
+    demand=''
+    if film_id:
+        tracked=[r for r in store.tracking_rows() if r['id']==film_id]
+        if tracked:
+            r=tracked[0];n=r['total_count']
+            demand='<p class="demand">'+(f'{n:,}'.replace(',',' ')+' <small>запросов / 30 дней</small>' if n is not None else 'Ожидает Wordstat')+'</p>'
     form='' if confirmed else (f'<details class="analysis"><summary>Подтвердить фильм</summary><form class="edit-form" action="/radar-confirm" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}">'
           f'<label class="wide">Название<input name="title" maxlength="160" required value="{esc(row["title"],quote=True)}"></label><label>Год<input name="year" maxlength="4" inputmode="numeric"></label><label>Тип<select name="type" aria-label="Тип"><option value="films">Фильм</option><option value="serials">Сериал</option></select></label><button class="wide" type="submit">Подтвердить и следить</button></form></details>')
-    return (f'<article class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+'</div>'+form+'</article>')
+    return (f'<article class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+promote+'</div>'+demand+form+'</article>')
 
 
 def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
@@ -1231,10 +1273,13 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
     all_rows=store.rows('title ASC','status!="watched"',10000)
     new_rows=store.new_rows();watch_rows=store.watch_rows();ad_rows=promotion_rows(store);signals=growth_rows(store);early=growth_rows(store,True);radar=radar_rows(store)
     watched={r['id'] for r in watch_rows};promoted={r['id'] for r in ad_rows}
+    all_rows=[r for r in all_rows if r['id'] not in promoted]
+    watch_rows=[r for r in watch_rows if r['id'] not in promoted]
+    radar=[r for r in radar if (r.get('confirmed_id') or r.get('match_id')) not in promoted]
     tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
     links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
     headings={'catalog':'Каталог тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы','radar':'Радар интереса · Россия','ads':'Фильмы и сериалы в рекламе'}
-    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Подтверждённо доступны и ожидают вашей проверки.','signals':'Свежие данные Wordstat. Ранний рост показываем без рекламных уведомлений.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
+    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Рост и спрос выше 50 000; для тайтлов из Радара - проверенный спрос выше 50 000.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
     rows={'catalog':all_rows,'new':new_rows,'signals':early if mode=='early' else signals,'watch':watch_rows,'radar':radar,'ads':ad_rows}[view]
     if view=='catalog':
         if mode in ('available','soon','unknown'):rows=[r for r in rows if detail_for(store,r)['availability']==mode]
@@ -1250,7 +1295,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
         label='Добавить фильм или сериал' if view=='watch' else 'Добавить тайтл в рекламу'
         button='Следить' if view=='watch' else 'В рекламу'
         add=f'<form class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><button type="submit">{button}</button></form>'
-    entries=''.join(radar_card(row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:100])
+    entries=''.join(radar_card(store,row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:100])
     empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет свежих сигналов по выбранным условиям. Старые данные не считаются текущим ростом.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
     if not entries:entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
     notices=''
@@ -1260,9 +1305,11 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
         if store.meta('catalog_feed_error',''):notices+='<p class="notice status-notice">Не удалось обновить фид каталога. Последние данные сохранены.</p>'
     if view=='ads':notices+='<p class="notice">Предупреждение: падение не менее 30% на двух разных последовательных датах данных. Повторная загрузка одной даты не считается подтверждением. Даже при спросе ниже 50 000. Реклама автоматически не отключается.</p>'
     if view=='radar':notices+=source_status(store)+'<p class="notice">Читаем доступные публичные ленты, без входа в закрытые каналы и без обхода защиты. Новые названия подтверждаются вручную перед проверкой Wordstat.</p>'
+    queued_top=int(store.meta('wordstat_top_queue','0'));queued_dyn=int(store.meta('wordstat_dynamics_queue','0'))
+    if queued_top or queued_dyn:notices+=f'<p class="notice status-notice">В очереди Wordstat: спрос - {queued_top}, динамика - {queued_dyn}. Проверки продолжаются автоматически в пределах суточных лимитов.</p>'
     if store.meta('last_errors',''):notices+='<p class="notice status-notice">Часть данных не обновилась. Последние сохранённые значения доступны в карточках.</p>'
     updated=esc(short_date(store.meta('last_tvoe','')))
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Фильмы, интерес к которым растёт</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Фильмы, интерес к которым растёт</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
 
 
 def start_dashboard(store, secret, allowed_id, port, app=None):
@@ -1335,6 +1382,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                             if app is not None:
                                 try:app.send_new_alerts()
                                 except RuntimeError:pass
+                                app.refresh_async(notify=False)
                             target='/?view=catalog&saved=feed'
                         elif path=='/promotion':
                             active=fields.get('active')
@@ -1342,6 +1390,14 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                             if not ident:
                                 ident,added=store.add_watch(fields.get('title',''))
                                 refresh_id=ident if added else None
+                            radar_id=fields.get('radar_id','')
+                            if radar_id:
+                                with store.lock,store.db:
+                                    radar=store.db.execute('SELECT title FROM radar_items WHERE id=?',(radar_id,)).fetchone()
+                                    if not radar:raise ValueError('Публикация не найдена.')
+                                    store.db.execute('UPDATE radar_items SET confirmed_id=? WHERE id=?',(ident,radar_id))
+                                    radar_kind=store.meta('radar_kind:'+radar_id,'')
+                                    if radar_kind in ('films','serials'):store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(radar_kind,ident))
                             set_promotion(store,ident,active=='1')
                             if active=='1': refresh_id=ident
                             target='/?view=ads&saved=promotion'
@@ -1357,12 +1413,14 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                                 if kind not in ('films','serials') or len(query)>180 or any(ord(c)<32 for c in query):raise ValueError('Проверьте тип и запрос.')
                                 old=detail_for(store,dict(row)).get('query_override') or ''
                                 set_availability(store,ident,fields.get('availability','unknown'),year=fields.get('year','').strip())
+                                if fields.get('availability')=='available' and not row['measured_at']:refresh_id=ident
                                 store.db.execute('UPDATE titles SET type=? WHERE id=?',(kind,ident))
                                 store.db.execute('UPDATE film_details SET query_override=? WHERE title_id=?',(query,ident))
                                 if old!=query or row['type']!=kind:
                                     store.db.execute('UPDATE titles SET measured_at=NULL,total_count=NULL,dynamics_json=NULL,trend=NULL,delta=NULL,ambiguous=0 WHERE id=?',(ident,))
                                     store.set_meta('dynamics_checked:'+ident,'')
                                     store.set_meta('growth_alert:'+ident,'quiet')
+                                    store.set_meta('radar_alert:'+ident,'quiet')
                                     store.db.execute('DELETE FROM decline_state WHERE title_id=?',(ident,))
                                     refresh_id=ident
                             if app is not None:
@@ -1469,7 +1527,7 @@ class BotApp:
             batch = rows[offset:offset+8]
             message = '🆕 Уже доступно в TVOЁ:\n' + '\n'.join(
                 f'{r["title"]} - доступность подтверждена' for r in batch)
-            self.bot.send(message + '\nСписок сохранён в разделе «Новое» до вашей проверки рекламы.', MENU)
+            self.bot.send(message + '\nСписок сохранён в разделе «Новое» до переноса в рекламу.', MENU)
             with self.store.lock, self.store.db:
                 self.store.db.executemany('UPDATE review_queue SET notified_at=? WHERE title_id=?', [(now(),r['id']) for r in batch])
 
@@ -1485,19 +1543,25 @@ class BotApp:
                 self.store.db.execute('UPDATE decline_state SET notified=1 WHERE title_id=?',(row['id'],))
 
     def send_growth_alerts(self, alerts):
-        pending={r['id']:{'id':r['id'],'title':r['title'],'count':r['total_count'],'delta':r['delta'],'query':r['wordstat_query']} for r in growth_rows(self.store) if self.store.meta('growth_alert:'+r['id'])!='sent'}
-        pending.update({r['id']:r for r in alerts})
-        for row in pending.values():
-            if self.store.meta('growth_alert:'+row['id'])=='sent':continue
-            count = f'{row["count"]:,}'.replace(',',' ')
-            delta = f'{row["delta"]:+,}'.replace(',',' ')
-            message = (f'📈 Сигнал для проверки рекламы: {row["title"]}\n'
-                       f'Wordstat: {count} запросов за 30 дней.\n'
-                       f'Динамика: {delta} запросов за последние 7 дней к предыдущим 7.\n'
-                       f'Запрос: {row["query"]}\n'
-                       'Проверьте соответствие запроса тайтлу и экономику кампании перед запуском.')
+        radar=radar_tracked_ids(self.store)
+        for row in growth_alert_rows(self.store):
+            c=demand_comparison(row)
+            growing=bool(c and signal_fresh(self.store,row,c) and row['trend']=='растёт' and c['percent'] is not None and not self.store.meta('dynamics_error:'+row['id'],''))
+            key=('growth_alert:' if growing else 'radar_alert:')+row['id']
+            if self.store.meta(key)=='sent':continue
+            # A high-demand notice already includes growth when both happen together.
+            count=f'{row["total_count"]:,}'.replace(',',' ')
+            message=(('📈 Спрос растёт: ' if growing else '🔎 Радар: спрос выше 50 000 - ')+row['title']+'\n'
+                     f'Wordstat: {count} запросов за 30 дней.\n')
+            if growing:message+=f'Рост {c["percent"]:.1f}%: {c["older"]:,} → {c["newer"]:,}, два полных периода по 7 дней.\n'
+            else:message+='Рост пока не подтверждён.\n'
+            message+=f'Запрос: {row["wordstat_query"]}\n'
+            if row['total_count']>50000:message+='Добавлен в «Сигналы».\n'
+            else:message+='Остаётся на отслеживании.\n'
+            message+='Доступность в TVOЁ и результаты кампании проверяйте перед продвижением.'
             self.bot.send(message,MENU)
-            self.store.set_meta('growth_alert:'+row['id'],'sent')
+            self.store.set_meta(key,'sent')
+            if row['id'] in radar and row['total_count']>50000:self.store.set_meta('radar_alert:'+row['id'],'sent')
 
     def status_message(self,text,keyboard=None):
         try: self.bot.send(text,keyboard)
@@ -1632,7 +1696,7 @@ def main():
                     if not result.get('busy'):
                         app.send_growth_alerts(result['alerts'])
                         app.send_decline_alerts()
-                        next_analysis = time.monotonic() + (3600 if result['errors'] else 86400)
+                        next_analysis = time.monotonic() + 3600
                 elif analyzer.lock.acquire(blocking=False):
                     try:
                         refresh_catalog_feed(store)
@@ -1645,7 +1709,9 @@ def main():
             time.sleep(3600)
     def radar_schedule():
         while True:
-            try: refresh_radar(store)
+            try:
+                added=refresh_radar(store)
+                if added:app.refresh_async(notify=False)
             except Exception as exc: print('Radar refresh error: '+type(exc).__name__,flush=True)
             time.sleep(1800)
     threading.Thread(target=radar_schedule,daemon=True).start()
