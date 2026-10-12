@@ -294,7 +294,10 @@ class Store:
             key = ' '.join(re.sub(r'[^\w]+',' ',title.casefold()).split())
             if not key: raise ValueError('Введите название фильма.')
             existing = self.db.execute('SELECT title_id FROM watchlist WHERE name_key=?',(key,)).fetchone()
-            if existing: return existing['title_id'], False
+            if existing:
+                resumed=not tracking_enabled(self,existing['title_id'])
+                resume_tracking(self,existing['title_id'])
+                return existing['title_id'], resumed
             if not ident:
                 matches = [r for r in self.db.execute('SELECT id,title FROM titles')
                            if ' '.join(re.sub(r'[^\w]+',' ',r['title'].casefold()).split())==key]
@@ -303,6 +306,7 @@ class Store:
                     ident='watch:'+hashlib.sha256(key.encode()).hexdigest()[:32]
                     stamp=now()
                     self.db.execute('INSERT OR IGNORE INTO titles(id,title,type,first_seen,last_seen,status) VALUES(?,?,"films",?,?,"watched")',(ident,title,stamp,stamp))
+            resume_tracking(self,ident)
             self.db.execute('INSERT INTO watchlist VALUES(?,?,?)',(ident,key,now()))
             return ident, True
 
@@ -385,7 +389,7 @@ class Store:
         if order not in allowed:
             raise ValueError('Unsupported sort')
         with self.lock:
-            return [dict(row) for row in self.db.execute(f'SELECT * FROM titles WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', (*params,limit,offset))]
+            return [dict(row) for row in self.db.execute(f'SELECT * FROM titles WHERE ({where}) AND id NOT IN (SELECT title_id FROM title_control WHERE deleted=1) ORDER BY {order} LIMIT ? OFFSET ?', (*params,limit,offset))]
 
     def find(self, term):
         return self.rows('title ASC', 'title LIKE ?', 10, 0, ('%'+term+'%',))
@@ -431,6 +435,7 @@ def film_schema(store):
             availability TEXT NOT NULL DEFAULT 'unknown', available_at TEXT,
             evidence TEXT, query_override TEXT, updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS title_control (title_id TEXT PRIMARY KEY, paused INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, name_key TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS promotions (
             title_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1,
             added_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -487,6 +492,35 @@ def set_availability(store, ident, state, evidence='Подтверждено п�
             store.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,"published",?)',(ident,stamp,evidence))
 
 
+def tracking_enabled(store,ident):
+    with store.lock:row=store.db.execute('SELECT paused,deleted FROM title_control WHERE title_id=?',(ident,)).fetchone()
+    return not row or not (row['paused'] or row['deleted'])
+
+
+def resume_tracking(store,ident):
+    with store.lock,store.db:
+        store.db.execute('UPDATE title_control SET paused=0,deleted=0,updated_at=? WHERE title_id=?',(now(),ident))
+
+
+def pause_tracking(store,ident,deleted=False):
+    with store.lock,store.db:
+        row=store.db.execute('SELECT title FROM titles WHERE id=?',(ident,)).fetchone()
+        if not row:raise ValueError('Тайтл не найден.')
+        key=name_key(row['title'])
+        store.db.execute('INSERT INTO title_control VALUES(?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET paused=1,deleted=MAX(title_control.deleted,excluded.deleted),name_key=excluded.name_key,updated_at=excluded.updated_at',(ident,1,int(deleted),key,now()))
+        if deleted:
+            store.db.execute('UPDATE promotions SET active=0,updated_at=? WHERE title_id=?',(now(),ident))
+            store.db.execute('DELETE FROM watchlist WHERE title_id=?',(ident,))
+            store.db.execute('UPDATE radar_items SET dismissed=1 WHERE confirmed_id=? OR match_id=?',(ident,ident))
+            for row in store.db.execute('SELECT id,title FROM radar_items WHERE confirmed_id IS NULL AND match_id IS NULL').fetchall():
+                if name_key(row['title'])==key:store.db.execute('UPDATE radar_items SET dismissed=1 WHERE id=?',(row['id'],))
+        store.db.execute('DELETE FROM decline_state WHERE title_id=?',(ident,))
+
+
+def deleted_name(store,title):
+    with store.lock:return bool(store.db.execute('SELECT 1 FROM title_control WHERE deleted=1 AND name_key=?',(name_key(title),)).fetchone())
+
+
 def set_promotion(store, ident, active):
     with store.lock, store.db:
         if not store.db.execute('SELECT 1 FROM titles WHERE id=?',(ident,)).fetchone(): raise ValueError('Фильм не найден.')
@@ -494,6 +528,8 @@ def set_promotion(store, ident, active):
         old=store.db.execute('SELECT active FROM promotions WHERE title_id=?',(ident,)).fetchone()
         store.db.execute('INSERT INTO promotions VALUES(?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET active=excluded.active,updated_at=excluded.updated_at',(ident,int(active),stamp,stamp))
         if not active or not old or not old['active']: store.db.execute('DELETE FROM decline_state WHERE title_id=?',(ident,))
+        if active:resume_tracking(store,ident)
+        else:pause_tracking(store,ident)
 
 
 def promotion_rows(store):
@@ -502,7 +538,7 @@ def promotion_rows(store):
 
 def all_tracking(store):
     # A departure from the coming-soon list is not a departure from the cinema.
-    return store.rows('title ASC','status!="watched" OR id IN (SELECT title_id FROM watchlist) OR id IN (SELECT title_id FROM promotions WHERE active=1)',10000)
+    return store.rows('title ASC','(status!="watched" OR id IN (SELECT title_id FROM watchlist) OR id IN (SELECT title_id FROM promotions WHERE active=1)) AND id NOT IN (SELECT title_id FROM title_control WHERE paused=1)',10000)
 
 
 def demand_comparison(row):
@@ -689,7 +725,7 @@ def import_radar(store, source, items):
                     if age>timedelta(days=7) or age<timedelta(hours=-2):continue
                 except (ValueError,TypeError):published=''
             for title,ident in radar_candidates(store,item,source['id']=='google_ru'):
-                if not title or not safe_url(item['url']):continue
+                if not title or not safe_url(item['url']) or deleted_name(store,title):continue
                 stable=hashlib.sha256((source['id']+'|'+item['url']+'|'+name_key(title)+'|'+published).encode()).hexdigest()
                 cur=store.db.execute('INSERT OR IGNORE INTO radar_items(id,source_id,url,title,reason,published_at,found_at,match_id) VALUES(?,?,?,?,?,?,?,?)',(stable,source['id'],item['url'],title[:160],reason_for(item['text'],source['id']=='google_ru'),published,stamp,ident))
                 added+=cur.rowcount
@@ -711,7 +747,7 @@ def auto_track_radar(store):
     """Discover candidates within existing Wordstat budgets, without claiming availability."""
     grouped={}
     for row in radar_rows(store):
-        if row['confirmed_id']:continue
+        if row['confirmed_id'] or deleted_name(store,row['title']):continue
         grouped.setdefault(name_key(row['title']),[]).append(row)
     added=0
     for rows in grouped.values():
@@ -723,6 +759,7 @@ def auto_track_radar(store):
         independent={r['source_id'] for r in rows if r['source_id']!='google_news'}
         if known:
             ident=next(iter(known))
+            if not tracking_enabled(store,ident):continue
             if store.meta('auto_radar_seen:'+ident,''):continue
             ident,new=store.add_watch(ident=ident)
         else:
@@ -911,11 +948,13 @@ class Analyzer:
             top_remaining=max(0,self.top_budget-int(self.store.meta(top_key,'0')))
             self.store.set_meta('wordstat_top_queue',str(max(0,len(rows)-top_remaining)))
             for row in rows[:top_remaining]:
+                if not tracking_enabled(self.store,row['id']):continue
                 self.store.set_meta(top_key,str(int(self.store.meta(top_key,'0'))+1))
                 try:
                     override = detail_for(self.store,row).get('query_override')
                     initial = self.wordstat.top(override or row['title'])
                     query, note, ambiguous = ((override, 'Запрос подтверждён пользователем.', False) if override else choose_query(row, initial))
+                    if not tracking_enabled(self.store,row['id']):continue
                     top = self.wordstat.top(query) if query != (override or row['title']) else initial
                     count = int(top['totalCount'])
                     self.store.measured(row['id'],query,note,ambiguous,count,None)
@@ -945,6 +984,7 @@ class Analyzer:
             dyn_remaining=max(0,self.dynamics_budget-int(self.store.meta(dyn_key,'0')))
             self.store.set_meta('wordstat_dynamics_queue',str(max(0,len(candidates)-dyn_remaining)))
             for row in candidates[:dyn_remaining]:
+                if not tracking_enabled(self.store,row['id']):continue
                 self.store.set_meta(dyn_key,str(int(self.store.meta(dyn_key,'0'))+1))
                 try:
                     points = self.wordstat.dynamics(row['wordstat_query'])
@@ -1211,6 +1251,7 @@ def film_card(store,row,view,csrf,watched,promoted):
     kind='Сериал' if row['type']=='serials' else 'Фильм'
     subtitle=kind+(' · '+d['year'] if d.get('year') else '')
     badges=availability_badge(store,row)
+    if not tracking_enabled(store,row['id']):badges+='<span class="badge warn">Слежение остановлено</span>'
     if row['ambiguous']:badges+='<span class="badge warn">Уточните запрос</span>'
     if c and not is_fresh:badges+='<span class="badge warn">Динамика устарела</span>'
     if view=='new':badges+='<span class="badge available">Опубликован · '+esc(short_date(d.get('available_at')))+' </span>'
@@ -1218,8 +1259,9 @@ def film_card(store,row,view,csrf,watched,promoted):
     change=f' <span class="trend {"fall-text" if c and c["delta"]<0 else ""}">{pct}</span>' if pct else ''
     controls=''
     if url:controls+=f'<a class="button secondary" href="{esc(url,quote=True)}" target="_blank" rel="noopener noreferrer">Открыть фильм</a>'
-    if row['id'] not in watched:controls+=action_form('/watch',csrf,{'id':row['id']},'Следить',True)
-    elif view=='watch':controls+=action_form('/unwatch',csrf,{'id':row['id']},'Убрать из списка',True)
+    controls+=action_form('/watch',csrf,{'id':row['id']},'Следить',True)
+    if row['id'] in watched and view=='watch':controls+=action_form('/unwatch',csrf,{'id':row['id']},'Убрать из списка',True)
+    controls+=action_form('/delete',csrf,{'id':row['id']},'Удалить',True)
     if row['id'] not in promoted:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'1'},'В рекламу')
     else:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'0'},'Убрать из рекламы',True)
     # New titles stay in the queue until moved to advertising.
@@ -1251,9 +1293,13 @@ def radar_card(store,row,csrf):
     confirmed=row.get('confirmed_id')
     state=('Название отслеживается · спрос проверяет Wordstat' if confirmed else 'Название найдено в каталоге · проверьте совпадение' if row.get('match_id') else 'Совпадение требует проверки')
     film_id=confirmed or row.get('match_id')
+    if film_id and not tracking_enabled(store,film_id):state='Слежение остановлено · нажмите «Следить» для возобновления'
     fields={'active':'1','radar_id':row['id']}
     fields.update({'id':film_id} if film_id else {'title':row['title']})
     promote=action_form('/promotion',csrf,fields,'В рекламу')
+    follow_fields={k:v for k,v in fields.items() if k!='active'}
+    promote+=action_form('/watch',csrf,follow_fields,'Следить',True)
+    promote+=action_form('/delete',csrf,follow_fields,'Удалить',True)
     demand=''
     if film_id:
         tracked=[r for r in store.tracking_rows() if r['id']==film_id]
@@ -1309,7 +1355,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
     if queued_top or queued_dyn:notices+=f'<p class="notice status-notice">В очереди Wordstat: спрос - {queued_top}, динамика - {queued_dyn}. Проверки продолжаются автоматически в пределах суточных лимитов.</p>'
     if store.meta('last_errors',''):notices+='<p class="notice status-notice">Часть данных не обновилась. Последние сохранённые значения доступны в карточках.</p>'
     updated=esc(short_date(store.meta('last_tvoe','')))
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Фильмы, интерес к которым растёт</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Спрос на фильмы и сериалы</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
 
 
 def start_dashboard(store, secret, allowed_id, port, app=None):
@@ -1346,7 +1392,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed'):
+            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed','/delete'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
@@ -1370,12 +1416,16 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     return self.respond(400)
                 if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
                     return self.respond(403)
-                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed'):
+                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed','/delete'):
                     fields={k:v[0] for k,v in fields.items()}
                     ident=fields.get('id','')
                     refresh_id=None
                     try:
-                        if path=='/catalog-feed':
+                        if path=='/delete':
+                            if not ident:ident,_=store.add_watch(fields.get('title',''))
+                            pause_tracking(store,ident,deleted=True)
+                            target='/?saved=deleted'
+                        elif path=='/catalog-feed':
                             try:import_catalog_feed(store,fields.get('feed',''))
                             except ET.ParseError:raise ValueError('Не удалось прочитать XML. Проверьте файл.')
                             store.set_meta('catalog_feed_error','')
@@ -1447,6 +1497,12 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 elif path == '/watch':
                     try:
                         ident, added = store.add_watch(fields.get('title',[''])[0], fields.get('id',[''])[0])
+                        radar_id=fields.get('radar_id',[''])[0]
+                        if radar_id:
+                            with store.lock,store.db:
+                                store.db.execute('UPDATE radar_items SET confirmed_id=? WHERE id=?',(ident,radar_id))
+                                kind=store.meta('radar_kind:'+radar_id,'')
+                                if kind in ('films','serials'):store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(kind,ident))
                     except ValueError as exc:
                         return self.respond(400,html.escape(str(exc)).encode())
                     if app is not None and added:
