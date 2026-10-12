@@ -49,11 +49,11 @@ def request_json(url, payload=None, headers=None, timeout=20, attempts=3):
                 return json.load(response)
         except HTTPError as exc:
             code = exc.code
-            if code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
+            if code in (500, 502, 503, 504) and attempt + 1 < attempts:
                 time.sleep(min(2 ** attempt, 4))
                 continue
             raise APIError(f'HTTP {code} from {url.split("/")[2]}') from None
-        except (URLError, TimeoutError) as exc:
+        except (URLError, TimeoutError, OSError) as exc:
             if attempt + 1 < attempts:
                 time.sleep(min(2 ** attempt, 4))
                 continue
@@ -210,6 +210,7 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.radar_lock = threading.Lock()
         with self.db:
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS titles (
@@ -242,6 +243,8 @@ class Store:
                 self.set_meta('review_queue_migrated','1')
 
             self.db.execute('CREATE TABLE IF NOT EXISTS watchlist (title_id TEXT PRIMARY KEY, name_key TEXT UNIQUE NOT NULL, added_at TEXT NOT NULL)')
+
+            film_schema(self)
 
             # Recalculate current classification from saved points, preserving history.
             for row in self.db.execute('SELECT id,dynamics_json FROM titles WHERE dynamics_json IS NOT NULL').fetchall():
@@ -307,17 +310,17 @@ class Store:
         return self.rows('title ASC','id IN (SELECT title_id FROM watchlist)',10000)
 
     def tracking_rows(self):
-        return self.rows('title ASC','status="active" OR id IN (SELECT title_id FROM watchlist)',10000)
+        return all_tracking(self)
 
     def new_rows(self):
-        return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000)
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)', 10000) if detail_for(self,r)['availability']=='available']
 
     def mark_reviewed(self, ident):
         with self.lock, self.db:
             self.db.execute('UPDATE review_queue SET reviewed_at=? WHERE title_id=?', (now(),ident))
 
     def pending_new(self):
-        return self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL)', 10000)
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL)', 10000) if detail_for(self,r)['availability']=='available']
 
     def meta(self, key, default=None):
         with self.lock:
@@ -350,9 +353,12 @@ class Store:
                         if old[field] != item[field]:
                             self.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,?,?)', (item['id'],timestamp,'changed',field))
                     self.db.execute('UPDATE titles SET title=?,type=?,genre=?,poster_date=?,url=?,seasons_count=?,last_seen=?,status="active" WHERE id=?', (item['title'],item['type'],item['genre'],item['poster_date'],item['url'],str(item['seasons_count']) if item['seasons_count'] is not None else None,timestamp,item['id']))
+                self.db.execute('INSERT OR IGNORE INTO film_details(title_id,availability,evidence,updated_at) VALUES(?,"soon","Раздел Скоро TVOЁ",?)',(item['id'],timestamp))
+                self.db.execute('UPDATE film_details SET availability="soon",updated_at=? WHERE title_id=? AND availability="unknown" AND evidence="Раздел Скоро TVOЁ"',(timestamp,item['id']))
                 prior.pop(item['id'], None)
             for ident in prior:
                 self.db.execute('UPDATE titles SET status="removed" WHERE id=?', (ident,))
+                self.db.execute('UPDATE film_details SET availability="unknown" WHERE title_id=? AND availability="soon" AND evidence="Раздел Скоро TVOЁ"',(ident,))
                 self.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,?,?)', (ident,timestamp,'removed',prior[ident]['title']))
             self.db.execute('INSERT INTO metadata(key,value) VALUES("previous_tvoe",?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (previous,))
             self.db.execute('INSERT INTO metadata(key,value) VALUES("last_tvoe",?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (timestamp,))
@@ -382,11 +388,416 @@ class Store:
             return [dict(row) for row in self.db.execute(f'SELECT * FROM titles WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', (*params,limit,offset))]
 
     def find(self, term):
-        return self.rows('title ASC', 'status="active" AND title LIKE ?', 10, 0, ('%'+term+'%',))
+        return self.rows('title ASC', 'title LIKE ?', 10, 0, ('%'+term+'%',))
 
     def history(self, ident, limit=6):
         with self.lock:
             return [dict(row) for row in self.db.execute('SELECT * FROM measurements WHERE title_id=? ORDER BY id DESC LIMIT ?', (ident,limit))]
+
+
+# Independent radar and promotion state, kept in the existing SQLite database.
+from html.parser import HTMLParser
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
+
+RADAR_SOURCES = (
+    ('google_ru','Google Trends · Россия','rss','https://trends.google.com/trending/rss?geo=RU'),
+    ('interfax','Интерфакс · Новости кино','rss','https://www.interfax.ru/rss.asp'),
+    ('google_news','Google Новости · Кино','rss','https://news.google.com/rss/search?q=%28%D1%84%D0%B8%D0%BB%D1%8C%D0%BC+OR+%D1%81%D0%B5%D1%80%D0%B8%D0%B0%D0%BB+OR+%D1%82%D1%80%D0%B5%D0%B9%D0%BB%D0%B5%D1%80%29+when%3A2d&hl=ru&gl=RU&ceid=RU%3Aru'),
+    ('kinopoisk','Кинопоиск','telegram','https://t.me/s/kinopoisk'),
+    ('kinoafisha','Киноафиша','telegram','https://t.me/s/kinoafishainfo'),
+    ('filmpro','Фильм Про','telegram','https://t.me/s/filmpro_official'),
+)
+
+
+def name_key(value):
+    return ' '.join(re.sub(r'[^\w]+',' ',str(value).casefold().replace('ё','е')).split())
+
+
+def safe_url(value):
+    try:
+        parsed = urlparse(str(value or ''))
+        return str(value) if parsed.scheme=='https' and parsed.netloc and not parsed.username and not parsed.password else ''
+    except ValueError:
+        return ''
+
+
+def film_schema(store):
+    with store.lock, store.db:
+        store.db.executescript('''
+        CREATE TABLE IF NOT EXISTS film_details (
+            title_id TEXT PRIMARY KEY, year TEXT, poster TEXT,
+            availability TEXT NOT NULL DEFAULT 'unknown', available_at TEXT,
+            evidence TEXT, query_override TEXT, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS promotions (
+            title_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1,
+            added_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS decline_state (
+            title_id TEXT PRIMARY KEY, period_end TEXT, confirmations INTEGER DEFAULT 0,
+            notified INTEGER DEFAULT 0, checked_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS radar_sources (
+            id TEXT PRIMARY KEY, name TEXT, kind TEXT, url TEXT, checked_at TEXT,
+            success_at TEXT, error TEXT, failures INTEGER DEFAULT 0,
+            next_check TEXT, etag TEXT, modified TEXT
+        );
+        CREATE TABLE IF NOT EXISTS radar_items (
+            id TEXT PRIMARY KEY, source_id TEXT NOT NULL, url TEXT NOT NULL,
+            title TEXT NOT NULL, reason TEXT, published_at TEXT, found_at TEXT NOT NULL,
+            match_id TEXT, confirmed_id TEXT, dismissed INTEGER NOT NULL DEFAULT 0
+        );
+        ''')
+        store.db.execute("INSERT OR IGNORE INTO film_details(title_id,availability,evidence,updated_at) SELECT id,'soon','Раздел Скоро TVOЁ',last_seen FROM titles WHERE status='active'")
+        for ident,name,kind,url in RADAR_SOURCES:
+            store.db.execute('INSERT OR IGNORE INTO radar_sources(id,name,kind,url) VALUES(?,?,?,?)',(ident,name,kind,url))
+
+
+def detail_for(store, row):
+    with store.lock:
+        found=store.db.execute('SELECT * FROM film_details WHERE title_id=?',(row['id'],)).fetchone()
+    detail=dict(found) if found else {'availability':'unknown','year':'','poster':'','available_at':'','query_override':''}
+    if detail['availability']=='unknown' and row['status']=='active' and row['poster_date']:
+        try:
+            if date.fromisoformat(str(row['poster_date'])[:10]) > datetime.now(UTC).date(): detail['availability']='soon'
+        except ValueError: pass
+    return detail
+
+
+def set_availability(store, ident, state, evidence='Подтверждено пользователем', year='', poster='', available_at=''):
+    if state not in ('available','soon','unknown','unavailable'): raise ValueError('Выберите доступность фильма.')
+    if year and (not year.isdigit() or not 1880<=int(year)<=datetime.now(UTC).year+10): raise ValueError('Проверьте год фильма.')
+    if available_at: date.fromisoformat(available_at[:10])
+    with store.lock, store.db:
+        row=store.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()
+        if not row: raise ValueError('Фильм не найден.')
+        previous=store.db.execute('SELECT * FROM film_details WHERE title_id=?',(ident,)).fetchone()
+        old=previous['availability'] if previous else 'unknown'
+        # Missing availability in a feed is not evidence of withdrawal. Explicit
+        # true/false from the trusted catalog can supersede an older manual check.
+        if previous and state=='unknown' and evidence!='Подтверждено пользователем': return
+        stamp=now()
+        store.db.execute('INSERT INTO film_details(title_id,availability,available_at,evidence,year,poster,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET availability=excluded.availability,available_at=excluded.available_at,evidence=excluded.evidence,year=CASE WHEN excluded.year!="" THEN excluded.year ELSE film_details.year END,poster=CASE WHEN excluded.poster!="" THEN excluded.poster ELSE film_details.poster END,updated_at=excluded.updated_at',
+                         (ident,state,available_at or (stamp if state=='available' else ''),evidence,year,safe_url(poster),stamp))
+        if state=='available' and old!='available':
+            store.db.execute('INSERT INTO review_queue(title_id,added_at,reviewed_at,notified_at) VALUES(?,?,NULL,NULL) ON CONFLICT(title_id) DO UPDATE SET added_at=excluded.added_at,reviewed_at=NULL,notified_at=NULL',(ident,stamp))
+            store.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,"published",?)',(ident,stamp,evidence))
+
+
+def set_promotion(store, ident, active):
+    with store.lock, store.db:
+        if not store.db.execute('SELECT 1 FROM titles WHERE id=?',(ident,)).fetchone(): raise ValueError('Фильм не найден.')
+        stamp=now()
+        old=store.db.execute('SELECT active FROM promotions WHERE title_id=?',(ident,)).fetchone()
+        store.db.execute('INSERT INTO promotions VALUES(?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET active=excluded.active,updated_at=excluded.updated_at',(ident,int(active),stamp,stamp))
+        if not active or not old or not old['active']: store.db.execute('DELETE FROM decline_state WHERE title_id=?',(ident,))
+
+
+def promotion_rows(store):
+    return store.rows('title ASC','id IN (SELECT title_id FROM promotions WHERE active=1)',10000)
+
+
+def all_tracking(store):
+    # A departure from the coming-soon list is not a departure from the cinema.
+    return store.rows('title ASC','status!="watched" OR id IN (SELECT title_id FROM watchlist) OR id IN (SELECT title_id FROM promotions WHERE active=1)',10000)
+
+
+def demand_comparison(row):
+    try: return weekly_comparison(json.loads(row.get('dynamics_json') or '[]'))
+    except (ValueError,TypeError): return None
+
+
+def signal_fresh(store, row, comparison=None):
+    comparison = comparison or demand_comparison(row)
+    try:
+        if not comparison: return False
+        lag=(datetime.now(UTC).date()-date.fromisoformat(comparison['to'])).days
+        age=datetime.now(UTC)-datetime.fromisoformat(row['measured_at'])
+        return 0<lag<=7 and timedelta(0)<=age<=timedelta(days=3)
+    except (ValueError,TypeError,KeyError): return False
+
+
+def growth_rows(store, early=False):
+    rows=[]
+    for row in all_tracking(store):
+        c=demand_comparison(row)
+        if row['ambiguous'] or not c or not signal_fresh(store,row,c) or row['trend']!='растёт': continue
+        n=row['total_count'] or 0
+        if early:
+            # Percentage alone over tiny values does not make a useful early signal.
+            if 1000<=n<=50000 and c['older']>=100 and c['delta']>=100: rows.append(row)
+        elif n>50000: rows.append(row)
+    return sorted(rows,key=lambda r:r['delta'] or 0,reverse=True)
+
+
+def evaluate_decline(store, row):
+    c=demand_comparison(row)
+    if row['ambiguous'] or not signal_fresh(store,row,c) or not c or c['percent'] is None: return None
+    if store.meta('dynamics_error:'+row['id'],''): return None
+    with store.lock, store.db:
+        previous=store.db.execute('SELECT * FROM decline_state WHERE title_id=?',(row['id'],)).fetchone()
+        if previous and previous['period_end']==c['to']: return None  # Re-reading cached data is not confirmation.
+        previous_count=previous['confirmations'] if previous else 0
+        sent=previous['notified'] if previous else 0
+        if c['percent']<=-30:
+            continuous=previous and previous['period_end'] and 0<(date.fromisoformat(c['to'])-date.fromisoformat(previous['period_end'])).days<=7
+            count=previous_count+1 if continuous else 1
+        else:
+            count=0
+            if c['percent']>-15: sent=0
+        store.db.execute('INSERT INTO decline_state VALUES(?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET period_end=excluded.period_end,confirmations=excluded.confirmations,notified=excluded.notified,checked_at=excluded.checked_at',(row['id'],c['to'],count,sent,now()))
+        if count>=2 and not sent: return {**row,'comparison':c}
+    return None
+
+
+def pending_declines(store):
+    result=[]
+    for row in promotion_rows(store):
+        c=demand_comparison(row)
+        with store.lock: state=store.db.execute('SELECT * FROM decline_state WHERE title_id=?',(row['id'],)).fetchone()
+        if state and state['confirmations']>=2 and not state['notified'] and c and signal_fresh(store,row,c) and c['percent'] is not None and c['percent']<=-30 and not row['ambiguous'] and not store.meta('dynamics_error:'+row['id'],''):
+            result.append({**row,'comparison':c})
+    return result
+
+
+def bounded_text(url, headers=None, max_bytes=2_000_000):
+    req=Request(url,headers={'User-Agent':'TVOE-Demand-Monitor/2.0','Accept':'application/rss+xml, application/xml, text/html;q=0.8',**(headers or {})})
+    with urlopen(req,timeout=12) as response:
+        raw=response.read(max_bytes+1)
+        if len(raw)>max_bytes: raise ValueError('Source too large')
+        return raw.decode('utf-8-sig'),dict(response.headers)
+
+
+def parse_rss(raw, google=False):
+    if '<!DOCTYPE' in raw.upper() or '<!ENTITY' in raw.upper(): raise ValueError('Unsafe XML')
+    root=ET.fromstring(raw)
+    if root.tag not in ('rss','{http://www.w3.org/2005/Atom}feed'): raise ValueError('Not a feed')
+    ns='{https://trends.google.com/trending/rss}'
+    result=[]
+    for node in root.findall('./channel/item')[:100]:
+        title=node.findtext('title','').strip();url=safe_url(node.findtext('link',''))
+        if not title or not url: continue
+        try: stamp=parsedate_to_datetime(node.findtext('pubDate','')).astimezone(UTC).isoformat()
+        except (ValueError,TypeError,AttributeError): stamp=''
+        description=html.unescape(re.sub('<[^>]+>',' ',node.findtext('description','')))
+        news=' '.join(x.findtext(ns+'news_item_title','') for x in node.findall(ns+'news_item'))
+        result.append({'title':title,'text':title+' '+description+' '+news,'url':url,'published_at':stamp})
+    return result
+
+
+class PublicTelegramParser(HTMLParser):
+    def __init__(self):
+        super().__init__();self.posts=[];self.current=None;self.depth=0;self.capture=0
+    def handle_starttag(self,tag,attrs):
+        a=dict(attrs);classes=a.get('class','').split()
+        if 'tgme_widget_message' in classes and re.fullmatch(r'[A-Za-z0-9_]+/\d+',a.get('data-post','')):
+            self.current={'title':'','text':'','url':'https://t.me/'+a['data-post'],'published_at':''};self.depth=1
+        elif self.current and tag not in ('br','img','meta','link','input','hr'): self.depth+=1
+        if self.current:
+            if 'tgme_widget_message_text' in classes:self.capture=self.depth
+            if tag=='time':self.current['published_at']=a.get('datetime','')
+            if tag=='br' and self.capture:self.current['text']+=' '
+    def handle_endtag(self,tag):
+        if tag in ('br','img','meta','link','input','hr'):return
+        if self.current:
+            if self.capture==self.depth:self.capture=0
+            self.depth-=1
+            if self.depth<=0:
+                if self.current['text'].strip():self.posts.append(self.current)
+                self.current=None;self.capture=0
+    def handle_data(self,data):
+        if self.current and self.capture:self.current['text']+=data
+
+
+def parse_telegram(raw):
+    if 'tgme_widget_message' not in raw or 'Site Unavailable' in raw or 'captcha' in raw.lower(): raise ValueError('Public preview unavailable')
+    parser=PublicTelegramParser();parser.feed(raw)
+    if not parser.posts: raise ValueError('No readable public posts')
+    return parser.posts[-30:]
+
+
+def reason_for(text, google=False):
+    lower=text.casefold()
+    if 'трейлер' in lower:return 'Упоминание трейлера'
+    if 'сезон' in lower:return 'Упоминание сезона'
+    if 'премьер' in lower or 'релиз' in lower:return 'Упоминание премьеры или релиза'
+    if 'прокат' in lower or 'сбор' in lower:return 'Упоминание проката'
+    return 'Всплеск поискового интереса' if google else 'Упоминание в публикации'
+
+
+def radar_candidates(store, item, google=False):
+    text=item['text'];key=' '+name_key(text)+' '
+    matches=[]
+    for row in all_tracking(store):
+        k=name_key(row['title'])
+        if len(k)>=5 and (' '+k+' ') in key: matches.append(row)
+    candidates={name_key(r['title']):(r['title'],r['id'] if sum(name_key(x['title'])==name_key(r['title']) for x in matches)==1 else None) for r in matches}
+    context=bool(re.search(r'фильм|сериал|трейлер|мультфильм|кино|премьер|сезон',text,re.I))
+    if context:
+        for quoted in re.finditer(r'«([^»\n]{2,160})»',text):
+            title=quoted.group(1)
+            prefix=text[max(0,quoted.start()-65):quoted.start()]
+            # Singular film/series context next to the quote; do not treat publishers
+            # and streaming services quoted elsewhere in a headline as movie names.
+            explicit=re.search(r'(?:фильм(?:а|е|ом|у)?|сериал(?:а|е|ом|у)?|мультфильм(?:а|е|ом|у)?|трейлер(?:а|е|ом|у)?|хоррор(?:а|е|ом|у)?|комеди(?:я|и|ю)|триллер(?:а|е|ом|у)?)\s+(?:[^\s«»():.,]{1,20}\s+){0,2}$',prefix,re.I)
+            if explicit and not re.search(r'\b(?:в|на|от|для|с|у|канале|платформе)\s+$',prefix,re.I) and (2<=len(title.split())<=15 or len(title)>=5):
+                candidates.setdefault(name_key(title),(title,None))
+        if google and not candidates and re.search(r'фильм|сериал',item['title'],re.I):
+            title=re.sub(r'\s+(фильм|сериал)(\s+\d{4})?$', '',item['title'],flags=re.I).strip()
+            if len(title)>=5:candidates[name_key(title)]=(title,None)
+    return list(candidates.values())[:8]
+
+
+def import_radar(store, source, items):
+    stamp=now();added=0
+    with store.lock,store.db:
+        for item in items:
+            published=item.get('published_at','')
+            if published:
+                try:
+                    age=datetime.now(UTC)-datetime.fromisoformat(published.replace('Z','+00:00'))
+                    if age>timedelta(days=7) or age<timedelta(hours=-2):continue
+                except (ValueError,TypeError):published=''
+            for title,ident in radar_candidates(store,item,source['id']=='google_ru'):
+                if not title or not safe_url(item['url']):continue
+                stable=hashlib.sha256((source['id']+'|'+item['url']+'|'+name_key(title)+'|'+published).encode()).hexdigest()
+                cur=store.db.execute('INSERT OR IGNORE INTO radar_items(id,source_id,url,title,reason,published_at,found_at,match_id) VALUES(?,?,?,?,?,?,?,?)',(stable,source['id'],item['url'],title[:160],reason_for(item['text'],source['id']=='google_ru'),published,stamp,ident))
+                added+=cur.rowcount
+    return added
+
+
+def radar_rows(store):
+    cutoff=(datetime.now(UTC)-timedelta(days=7)).isoformat()
+    with store.lock:
+        return [dict(r) for r in store.db.execute('SELECT r.*,s.name source_name FROM radar_items r JOIN radar_sources s ON s.id=r.source_id WHERE r.dismissed=0 AND COALESCE(NULLIF(r.published_at,""),r.found_at)>=? ORDER BY r.found_at DESC LIMIT 100',(cutoff,))]
+
+
+def refresh_radar(store, transport=bounded_text):
+    if not store.radar_lock.acquire(blocking=False):return 0
+    try:return _refresh_radar(store,transport)
+    finally:store.radar_lock.release()
+
+
+def _refresh_radar(store, transport=bounded_text):
+    with store.lock:sources=[dict(r) for r in store.db.execute('SELECT * FROM radar_sources')]
+    added=0
+    for source in sources:
+        if source['next_check'] and source['next_check']>now():continue
+        headers={}
+        if source['etag']:headers['If-None-Match']=source['etag']
+        if source['modified']:headers['If-Modified-Since']=source['modified']
+        stamp=now()
+        try:
+            raw,h=transport(source['url'],headers)
+            items=parse_telegram(raw) if source['kind']=='telegram' else parse_rss(raw,source['id']=='google_ru')
+            added+=import_radar(store,source,items)
+            with store.lock,store.db:
+                store.db.execute('UPDATE radar_sources SET checked_at=?,success_at=?,error="",failures=0,next_check=?,etag=?,modified=? WHERE id=?',(stamp,stamp,(datetime.now(UTC)+timedelta(minutes=30)).isoformat(),h.get('ETag',''),h.get('Last-Modified',''),source['id']))
+        except HTTPError as exc:
+            if exc.code==304:
+                with store.lock,store.db:store.db.execute('UPDATE radar_sources SET checked_at=?,success_at=?,error="",next_check=? WHERE id=?',(stamp,stamp,(datetime.now(UTC)+timedelta(minutes=30)).isoformat(),source['id']))
+                continue
+            radar_error(store,source,stamp)
+        except (URLError,OSError,TimeoutError,ValueError,ET.ParseError,UnicodeError):radar_error(store,source,stamp)
+    return added
+
+
+def radar_error(store,source,stamp):
+    failures=source['failures']+1
+    with store.lock,store.db:
+        store.db.execute('UPDATE radar_sources SET checked_at=?,error=?,failures=?,next_check=? WHERE id=?',(stamp,'Источник временно недоступен. Последние найденные публикации сохранены.',failures,(datetime.now(UTC)+timedelta(minutes=min(360,30*2**min(failures,4)))).isoformat(),source['id']))
+
+
+def parse_catalog_feed(raw):
+    if '<!DOCTYPE' in raw.upper() or '<!ENTITY' in raw.upper():raise ValueError('Небезопасный XML.')
+    root=ET.fromstring(raw)
+    if root.tag!='yml_catalog':raise ValueError('Загрузите каталог TVOЁ в формате YML/XML.')
+    offers=root.findall('./shop/offers/offer')
+    if not offers or len(offers)>10000:raise ValueError('Фид пуст или содержит более 10 000 тайтлов.')
+    parsed=[];seen=set()
+    for offer in offers:
+        ident=offer.get('id','').strip();title=offer.findtext('name','').strip();link=offer.findtext('url','').strip()
+        if not ident or len(ident)>160 or not title or len(title)>160 or ident in seen:raise ValueError('Проверьте ID и названия: они должны быть заполнены, без повторов ID.')
+        seen.add(ident)
+        if link:
+            u=urlparse(link)
+            if u.scheme!='https' or u.hostname not in ('tvoe.live','www.tvoe.live'):raise ValueError('Ссылки фида должны вести на TVOЁ.')
+        params={p.get('name','').casefold():p.text or '' for p in offer.findall('param')}
+        year=params.get('год','').strip()
+        if year and (not year.isdigit() or not 1880<=int(year)<=datetime.now(UTC).year+10):raise ValueError('Проверьте год в фиде.')
+        kind='serials' if 'сериал' in params.get('тип','').casefold() else 'films'
+        available=offer.get('available','').casefold()
+        state='available' if available=='true' else 'unavailable' if available=='false' else 'unknown'
+        parsed.append({'id':ident,'name':title,'url':link,'type':kind,'year':year,'poster':offer.findtext('picture',''),'availability':state})
+    return parsed
+
+
+def import_catalog_feed(store,raw):
+    items=parse_catalog_feed(raw)  # Validate everything before mutating the existing data.
+    baseline=not store.meta('catalog_feed_updated','')
+    stamp=now()
+    with store.lock,store.db:
+        for item in items:
+            row=store.db.execute('SELECT * FROM titles WHERE id=?',(item['id'],)).fetchone()
+            if not row:
+                store.db.execute('INSERT INTO titles(id,title,type,url,first_seen,last_seen,status) VALUES(?,?,?,?,?,?,"active")',(item['id'],item['name'],item['type'],item['url'],stamp,stamp))
+            else:
+                store.db.execute('UPDATE titles SET title=?,type=?,url=?,last_seen=? WHERE id=?',(item['name'],item['type'],item['url'],stamp,item['id']))
+            before=detail_for(store,{'id':item['id'],'status':'active','poster_date':None})['availability']
+            set_availability(store,item['id'],item['availability'],'Каталог TVOЁ из фида',year=item['year'],poster=item['poster'])
+            if baseline and before!='available':
+                # First full catalog establishes a baseline, not a mass new-title alert.
+                store.db.execute('UPDATE review_queue SET reviewed_at=?,notified_at=? WHERE title_id=?',(stamp,stamp,item['id']))
+        store.set_meta('catalog_feed_updated',stamp)
+    return len(items)
+
+
+def refresh_catalog_feed(store):
+    url=os.environ.get('TVOE_CATALOG_FEED_URL','').strip()
+    if not url:return False
+    if not safe_url(url):
+        store.set_meta('catalog_feed_error','Проверьте адрес фида TVOЁ.');return False
+    try:
+        raw,_=bounded_text(url,max_bytes=8_000_000)
+        import_catalog_feed(store,raw);store.set_meta('catalog_feed_error','');return True
+    except (HTTPError,URLError,OSError,TimeoutError,ValueError,ET.ParseError):
+        store.set_meta('catalog_feed_error','Фид TVOЁ временно недоступен. Сохранённый каталог не удалён.');return False
+
+
+def confirm_radar(store, ident, title='', year='', kind='films'):
+    with store.lock,store.db:
+        row=store.db.execute('SELECT * FROM radar_items WHERE id=? AND dismissed=0',(ident,)).fetchone()
+        if not row:raise ValueError('Публикация не найдена.')
+        if kind not in ('films','serials'):raise ValueError('Выберите фильм или сериал.')
+        if year and (not year.isdigit() or not 1880<=int(year)<=datetime.now(UTC).year+10):raise ValueError('Проверьте год.')
+        if row['confirmed_id']:return row['confirmed_id'],False
+        chosen=title.strip() or row['title']
+        same=[r for r in store.rows('title ASC','1=1',10000) if name_key(r['title'])==name_key(chosen)]
+        exact=[r for r in same if r['type']==kind and detail_for(store,r).get('year')==year] if year else []
+        conflict=(any((detail_for(store,r).get('year') and detail_for(store,r).get('year')!=year) or (r['type'] and r['type']!=kind and r['status']!='watched') for r in same) if year else len(same)>1)
+        if len(exact)==1:
+            film_id,added=store.add_watch(ident=exact[0]['id'])
+        elif year and conflict:
+            film_id,added=store.add_watch(chosen+' ('+year+', '+kind_suffix(kind)+')')
+        elif not year and conflict:
+            raise ValueError('Есть несколько тайтлов с таким названием. Укажите год.')
+        else:
+            film_id,added=store.add_watch(chosen)
+        store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(kind,film_id))
+        if year:
+            previous_query=store.db.execute('SELECT wordstat_query FROM titles WHERE id=?',(film_id,)).fetchone()[0]
+            query=chosen+' '+kind_suffix(kind)+' '+year
+            store.db.execute('INSERT INTO film_details(title_id,year,query_override,updated_at) VALUES(?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET year=excluded.year,query_override=COALESCE(NULLIF(film_details.query_override,""),excluded.query_override),updated_at=excluded.updated_at',(film_id,year,query,now()))
+            effective_query=store.db.execute('SELECT query_override FROM film_details WHERE title_id=?',(film_id,)).fetchone()[0]
+            if previous_query and previous_query!=effective_query:
+                store.db.execute('UPDATE titles SET measured_at=NULL,total_count=NULL,dynamics_json=NULL,trend=NULL,delta=NULL WHERE id=?',(film_id,))
+                store.set_meta('dynamics_checked:'+film_id,'')
+                store.set_meta('growth_alert:'+film_id,'quiet')
+                store.db.execute('DELETE FROM decline_state WHERE title_id=?',(film_id,))
+        store.db.execute('UPDATE radar_items SET confirmed_id=? WHERE id=?',(film_id,ident))
+    return film_id,added
 
 
 class Analyzer:
@@ -410,6 +821,7 @@ class Analyzer:
                 self.store.set_meta(quota_key,used+1)
             if watch_id is None:
                 try:
+                    refresh_catalog_feed(self.store)
                     items = fetch_tvoe_items(self.transport)
                     stats['new'] = self.store.sync(items)
                     if self.on_synced:
@@ -424,13 +836,18 @@ class Analyzer:
                 except (ValueError,TypeError): return False
             # Reuse stored data for the day, including when a title is added twice.
             rows = [r for r in rows if not fresh(r['measured_at'])]
+            if self.store.meta('wordstat_retry_at','')>now():
+                rows=[]
+                stats['errors'].append('Wordstat: ожидание после ограничения частоты запросов')
             # Refresh never measured entries first, then stale measurements.
-            rows.sort(key=lambda r: r['measured_at'] or '')
+            promoted={r['id'] for r in promotion_rows(self.store)}
+            rows.sort(key=lambda r: (r['id'] not in promoted,r['measured_at'] or ''))
             for row in rows[:self.top_budget]:
                 try:
-                    initial = self.wordstat.top(row['title'])
-                    query, note, ambiguous = choose_query(row, initial)
-                    top = self.wordstat.top(query) if query != row['title'] else initial
+                    override = detail_for(self.store,row).get('query_override')
+                    initial = self.wordstat.top(override or row['title'])
+                    query, note, ambiguous = ((override, 'Запрос подтверждён пользователем.', False) if override else choose_query(row, initial))
+                    top = self.wordstat.top(query) if query != (override or row['title']) else initial
                     count = int(top['totalCount'])
                     self.store.measured(row['id'],query,note,ambiguous,count,None)
                     if count <= 50000:
@@ -441,16 +858,16 @@ class Analyzer:
                     self.store.set_meta('top_error:'+row['id'], now()+' | '+str(exc))
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
+                        self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
                         break
             watched = {r['id'] for r in self.store.watch_rows()}
             candidates = [row for row in self.store.tracking_rows()
-                          if row['total_count'] is not None and (row['total_count'] > 50000 or row['id'] in watched)
-                          and not row['ambiguous'] and row['wordstat_query']]
+                          if row['total_count'] is not None and (row['total_count']>=1000 or row['id'] in promoted or row['id'] in watched) and not row['ambiguous'] and row['wordstat_query']]
             candidates = [r for r in candidates if (watch_id is None or r['id']==watch_id)
                           and not fresh(self.store.meta('dynamics_checked:'+r['id'],''))]
-            if any('HTTP 429' in e for e in stats['errors']): candidates=[]
+            if any('HTTP 429' in e for e in stats['errors']) or self.store.meta('wordstat_retry_at','')>now(): candidates=[]
             # Rotate through eligible titles across days, including ones not measured in this pass.
-            candidates.sort(key=lambda row: (self.store.meta('dynamics_checked:'+row['id'],''),
+            candidates.sort(key=lambda row: (row['id'] not in promoted,self.store.meta('dynamics_checked:'+row['id'],''),
                                              -(row['total_count'] or 0)))
             for row in candidates[:self.dynamics_budget]:
                 try:
@@ -460,25 +877,29 @@ class Analyzer:
                     self.store.set_meta('dynamics_error:'+row['id'],'')
                     stats['dynamics'] += 1
                     direction, delta = trend(points)
-                    if row['total_count'] > 50000 and direction == 'растёт' and delta is not None and delta > 0:
+                    if row['total_count'] > 50000 and direction == 'растёт' and delta is not None and delta > 0 and signal_fresh(self.store,{**row,'dynamics_json':json.dumps(points)}):
                         if self.store.meta('growth_alert:'+row['id']) != 'sent':
                             stats['alerts'].append({
                                 'id':row['id'], 'title':row['title'],
                                 'count':row['total_count'], 'delta':delta,
                                 'query':row['wordstat_query']
                             })
-                    else:
+                    elif direction in ('стабильно','падает'):
                         self.store.set_meta('growth_alert:'+row['id'],'quiet')
                 except APIError as exc:
                     self.store.set_meta('dynamics_error:'+row['id'],now()+' | '+str(exc))
                     stats['errors'].append(str(exc))
                     if 'HTTP 429' in str(exc):
+                        self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
                         break
+            for promoted in promotion_rows(self.store):
+                evaluate_decline(self.store,promoted)
             tracking = self.store.tracking_rows()
             checked = sum(row['total_count'] is not None for row in tracking)
             if watch_id is None and checked == len(tracking) and not stats['errors']:
                 self.store.set_meta('last_full',now())
-            self.store.set_meta('last_errors', ', '.join(dict.fromkeys(stats['errors']))[:500])
+            if watch_id is None:
+                self.store.set_meta('last_errors', ', '.join(dict.fromkeys(stats['errors']))[:500])
             return stats
         except APIError as exc:
             stats['errors'].append(str(exc))
@@ -503,6 +924,7 @@ MENU = {'inline_keyboard': [
     [{'text':'🔥 Популярное','callback_data':'top:0'}, {'text':'📈 Рост','callback_data':'growth:0'}],
     [{'text':'🆕 Новое','callback_data':'new:0'}, {'text':'📅 Скоро','callback_data':'soon:0'}],
     [{'text':'🔄 Обновить','callback_data':'refresh'}, {'text':'🔎 Поиск','callback_data':'find'}],
+    [{'text':'🎯 В рекламе','callback_data':'ads'}, {'text':'👁 Следить','callback_data':'watch'}],
     [{'text':'ℹ️ Статус','callback_data':'status'}]
 ]}
 
@@ -561,7 +983,7 @@ def render_list(store, kind, page):
     where = {'top':'status="active" AND total_count IS NOT NULL AND ambiguous=0',
              'growth':'status="active" AND trend="растёт" AND ambiguous=0',
              'soon':'status="active" AND poster_date IS NOT NULL',
-             'new':'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL)'}[kind]
+             'new':'id IN (SELECT title_id FROM review_queue WHERE reviewed_at IS NULL) AND id IN (SELECT title_id FROM film_details WHERE availability="available")'}[kind]
     if kind == 'soon':
         rows = sorted(store.rows('title ASC', where, 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
     else:
@@ -591,8 +1013,10 @@ class Telegram:
             if not result.get('ok'):
                 raise RuntimeError('Telegram API rejected request')
             return result.get('result')
-        except (HTTPError, URLError, TimeoutError, ValueError):
-            raise RuntimeError('Telegram API unavailable') from None
+        except HTTPError as exc:
+            raise RuntimeError('Telegram HTTP '+str(exc.code)) from None
+        except (URLError, TimeoutError, ValueError, OSError) as exc:
+            raise RuntimeError('Telegram '+type(exc).__name__) from None
 
     def send(self, text, keyboard=None, chat_id=None):
         payload = {'chat_id':self.allowed if chat_id is None else chat_id, 'text':text[:4000], 'link_preview_options':{'is_disabled':True}}
@@ -623,33 +1047,6 @@ def valid_access(token, secret, allowed_id):
     except (ValueError, UnicodeError, binascii.Error):
         return False
 
-
-DASHBOARD_CSS = """
-:root{color-scheme:light;--paper:#f7f9fa;--white:#fff;--ink:#15232d;--muted:#52616a;--line:#dce3e7;--accent:#d64e36;--soft:#fff1ed}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45;-webkit-font-smoothing:antialiased}
-a{color:inherit}a:focus-visible,input:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
-header{background:var(--white);border-bottom:1px solid var(--line)}.head{max-width:1120px;margin:auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:18px}
-.brand{font-weight:850;font-size:1.32rem;letter-spacing:-.06em;text-decoration:none}.brand span{color:var(--accent)}.brand small{display:block;font-weight:550;letter-spacing:0;font-size:.7rem;color:var(--muted);margin-top:-3px}
-.stamp{font-size:.82rem;color:var(--muted);text-align:right}.stamp strong{display:block;font-weight:650;color:var(--ink)}
-main{max-width:1120px;margin:auto;padding:44px 24px 72px}.hero{display:flex;align-items:end;justify-content:space-between;gap:28px;padding-bottom:34px;border-bottom:1px solid var(--line)}
-h1{font-size:clamp(2.4rem,5.7vw,5rem);line-height:1.02;letter-spacing:-.065em;margin:0 0 14px;font-weight:780}.hero p{margin:0;color:var(--muted);font-size:1rem}.hero-facts{text-align:right;white-space:nowrap}.hero-facts strong{font-size:1.12rem;display:block}.hero-facts span{font-size:.82rem;color:var(--muted)}
-.signal-summary{display:flex;gap:18px;align-items:center;justify-content:space-between;margin:26px 0 4px;padding:20px 22px;background:var(--white);border:1px solid var(--line);border-radius:16px;text-decoration:none}
-.signal-summary.has-signals{border-color:#efb7a8;background:var(--soft)}.signal-summary strong{font-size:1.02rem;display:block}.signal-summary span{font-size:.85rem;color:var(--muted)}.signal-summary b{color:var(--accent);font-size:.9rem;white-space:nowrap}
-nav{display:flex;gap:28px;border-bottom:1px solid var(--line);margin-top:26px;overflow-x:auto}.tab{white-space:nowrap;text-decoration:none;padding:13px 2px 14px;color:var(--muted);font-size:.95rem;font-weight:650;border-bottom:3px solid transparent}.tab.active{color:var(--ink);border-color:var(--accent)}
-.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;padding-top:27px;margin-bottom:16px}.section-head h2{font-size:1.5rem;letter-spacing:-.035em;margin:0}.section-head p{margin:0;color:var(--muted);font-size:.85rem}
-.controls{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap;margin:18px 0 10px}.modes{display:flex;gap:5px;background:#e9eef0;border-radius:10px;padding:4px;overflow-x:auto}
-.mode{padding:8px 12px;border-radius:7px;text-decoration:none;white-space:nowrap;font-size:.86rem;font-weight:650;color:var(--muted)}.mode.active{background:var(--white);color:var(--ink);box-shadow:0 1px 3px #15232d18}
-form{display:flex;gap:8px;min-width:260px}input{min-width:0;width:210px;border:1px solid #c4d0d5;border-radius:9px;background:var(--white);padding:10px 12px;font:inherit;font-size:.9rem}button{border:0;border-radius:9px;background:var(--ink);color:#fff;padding:10px 14px;font:inherit;font-size:.9rem;font-weight:700;cursor:pointer}
-.list{background:var(--white);border:1px solid var(--line);border-radius:16px;overflow:hidden}.entry{display:grid;grid-template-columns:108px minmax(0,1fr) 164px;gap:20px;align-items:center;padding:18px 22px;border-bottom:1px solid var(--line)}.entry:last-child{border-bottom:0}
-.when{font-weight:700;color:var(--muted);font-size:.85rem}.title{font-size:1.13rem;line-height:1.25;font-weight:740;letter-spacing:-.025em;margin:0 0 5px}.title a{text-decoration:none}.title a:hover{text-decoration:underline}
-.detail{color:var(--muted);font-size:.82rem}.trend{display:inline-block;color:var(--accent);font-weight:650;margin-left:7px}.demand{text-align:right;font-size:1.11rem;font-weight:760;font-variant-numeric:tabular-nums}.demand small{display:block;font-weight:450;color:var(--muted);font-size:.72rem}
-.empty{padding:52px 22px;color:var(--muted)}.empty strong{display:block;color:var(--ink);font-size:1.05rem;margin-bottom:5px}
-.notice{margin-top:28px;color:var(--muted);font-size:.82rem;max-width:760px}.entry .review-action{grid-column:2 / -1;min-width:0;margin:2px 0 0;justify-content:flex-end}.review-button{min-height:44px;padding:8px 12px;background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:8px;font-size:.78rem;font-weight:600;white-space:nowrap}.review-button:hover{color:var(--ink);border-color:var(--muted)}@media(max-width:700px){.entry .review-action{grid-column:1 / -1;margin-top:8px}}
-.lock{max-width:540px;margin:12vh auto;padding:28px}.lock h1{font-size:2.8rem}.lock p{color:var(--muted)}.lock code{font:inherit;color:var(--accent)}
-@media(max-width:700px){.head{padding:14px 18px}.stamp{font-size:.68rem}main{padding:31px 16px 55px}.hero{display:block;padding-bottom:25px}.hero-facts{text-align:left;margin-top:20px}.signal-summary{padding:16px;gap:10px}.signal-summary b{font-size:.78rem}nav{gap:22px}.section-head{display:block}.section-head p{margin-top:5px}.controls{display:block}.modes{width:100%;justify-content:space-between}.mode{flex:1;text-align:center;padding:8px 7px;font-size:.78rem}form{margin-top:12px;min-width:0}input{width:100%;flex:1}.entry{grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;padding:15px 16px}.when{grid-column:1 / -1;color:var(--accent);font-size:.77rem}.demand{font-size:1rem}.demand small{font-size:.65rem}.title{font-size:1.06rem}.detail{font-size:.76rem}}
-.analysis{grid-column:1 / -1;font-size:.82rem;min-width:0}.analysis summary{cursor:pointer;padding:10px 0;color:var(--muted)}.analysis p{line-height:1.5;color:var(--muted)}.demand-chart{width:100%;max-width:640px;height:150px;color:var(--accent)}.data-error{color:#9c2424!important}.entry .ad-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));min-width:0;margin:16px 0;gap:12px}.ad-form label{display:grid;gap:6px;min-width:0}.ad-form input,.ad-form select,.ad-form textarea{box-sizing:border-box;width:100%;min-width:0;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit}.ad-form .wide{grid-column:1 / -1}.analysis li{padding:10px 0;overflow-wrap:anywhere}@media(max-width:700px){.entry .ad-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
-"""
 
 
 def title_analysis(store, row, csrf_field):
@@ -690,113 +1087,140 @@ def title_analysis(store, row, csrf_field):
 
 
 
-def dashboard_document(store, view, query, nonce, mode='date', csrf=''):
-    csrf_field = '<input type="hidden" name="csrf" value="' + html.escape(csrf,quote=True) + '">'
-    legacy = {'soon':('catalog','date'),'top':('catalog','top'),
-              'growth':('catalog','growth'),'ads':('signals','date')}
-    view, mode = legacy.get(view,(view,mode))
-    view = view if view in ('catalog','signals','new','watch') else 'catalog'
-    mode = mode if mode in ('date','top','growth') else 'date'
-    all_rows = store.rows('title ASC',limit=10000)
-    new_rows = store.new_rows()
-    watch_rows = store.watch_rows()
-    watch_ids = {r['id'] for r in watch_rows}
-    signal_rows = [row for row in store.tracking_rows() if row['total_count'] is not None
-                   and row['total_count'] > 50000 and row['trend']=='растёт'
-                   and not row['ambiguous']]
-    if view == 'signals':
-        rows = sorted(signal_rows,key=lambda r:r['delta'] or 0,reverse=True)
-    elif view == 'watch':
-        rows = watch_rows
-    elif view == 'new':
-        rows = sorted(new_rows,key=lambda r:r['first_seen'],reverse=True)
-    elif mode == 'top':
-        rows = sorted((row for row in all_rows if row['total_count'] is not None
-                       and not row['ambiguous']),key=lambda r:r['total_count'],reverse=True)
-    elif mode == 'growth':
-        rows = sorted((row for row in all_rows if row['trend']=='растёт'
-                       and not row['ambiguous']),key=lambda r:r['delta'] or 0,reverse=True)
-    else:
-        rows = sorted(all_rows,key=lambda r:(poster_sort(r['poster_date']),r['title']))
-    if query:
-        rows = [row for row in rows if query.casefold() in row['title'].casefold()]
-    escape = html.escape
-    tabs = [('catalog','Каталог',len(all_rows)),('signals','Сигналы',len(signal_rows)),
-            ('new','Новое',len(new_rows)),('watch','Отслеживаемые фильмы',len(watch_rows))]
-    links = ''.join(f'<a class="tab{" active" if view==key else ""}" href="/?view={key}"'
-                    f'{" aria-current=page" if view==key else ""}>{label} · {count}</a>'
-                    for key,label,count in tabs)
-    modes = [('date','По дате'),('top','По спросу'),('growth','Растут')]
-    mode_links = ''.join(f'<a class="mode{" active" if mode==key else ""}" '
-                         f'href="/?view=catalog&amp;mode={key}"'
-                         f'{" aria-current=page" if mode==key else ""}>{label}</a>'
-                         for key,label in modes) if view=='catalog' else ''
-    entries = []
-    seen = set()
-    for row in rows:
-        if row['id'] in seen:
-            continue
-        seen.add(row['id'])
-        date_label = ('Добавлен вручную' if row['status']=='watched' else ('Нет в текущем каталоге TVOЁ' if row['status']=='removed' else escape(str(row['poster_date'] or 'Дата не указана'))))
-        title = escape(row['title'])
-        kind = {'serials':'Сериал','films':'Фильм'}.get(row['type'],str(row['type'] or 'Тип не указан'))
-        detail = escape(kind) + (' · запрос неоднозначен' if row['ambiguous'] else '')
-        if row['trend']=='растёт' and row['delta'] is not None:
-            detail += '<span class="trend">↑ ' + f'{row["delta"]:+,}'.replace(',',' ') + ' за 7 дней</span>'
-        count = f'{row["total_count"]:,}'.replace(',',' ') if row['total_count'] is not None else '—'
-        raw_url = row['url'] or ''
-        safe_link = 'https://tvoe.live' + raw_url if raw_url.startswith('/') and not raw_url.startswith('//') else ''
-        heading = f'<a href="{escape(safe_link,quote=True)}" rel="noopener noreferrer">{title}</a>' if safe_link else title
-        analysis = title_analysis(store,row,csrf_field)
-        review = (f'<form class="review-action" action="/review" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit" title="Убрать из нового: проверка рекламы завершена" aria-label="Проверено для рекламы">✓ Проверено</button></form>' if view=='new' else '')
-        follow = (f'<span class="detail">Отслеживается</span>' if row['id'] in watch_ids else
-                  f'<form class="review-action" action="/watch" method="post">{csrf_field}<input type="hidden" name="id" value="{escape(row["id"],quote=True)}"><button class="review-button" type="submit">Следить</button></form>')
-        entries.append(f'<article class="entry"><div class="when">{date_label}</div>'
-                       f'<div><h3 class="title">{heading}</h3><div class="detail">{detail}</div></div>'
-                       f'<div class="demand">{count}<small>запросов / 30 дней</small></div>{review}{follow}{analysis}</article>')
-    empty = {'catalog':('Тайтлы пока не загружены','Бот обновит коллекцию автоматически.'),
-             'signals':('Рекламных сигналов пока нет','Здесь появятся однозначные запросы выше 50 000 с растущим спросом.'),
-             'watch':('Пока нет отслеживаемых фильмов','Введите название выше или нажмите «Следить» у тайтла в каталоге.'),
-             'new':('Новых тайтлов пока нет','Добавления остаются здесь до отметки «Проверено для рекламы».')}
-    if query and not entries:
-        empty_text = ('Ничего не найдено','Попробуйте другое название или откройте каталог.')
-    else:
-        empty_text = empty[view]
-    content = '<div class="list">' + (''.join(entries) if entries else
-              f'<div class="empty"><strong>{empty_text[0]}</strong>{empty_text[1]}</div>') + '</div>'
-    updated = store.meta('last_tvoe','')
-    try:
-        stamp = datetime.fromisoformat(updated.replace('Z','+00:00')).astimezone(ZoneInfo('Europe/Moscow'))
-        updated_text = stamp.strftime('%d.%m.%Y в %H:%M МСК')
-    except ValueError:
-        updated_text = 'ожидается первое обновление'
-    checked = sum(row['total_count'] is not None for row in all_rows)
-    heading = {'catalog':'Каталог тайтлов','signals':'Сигналы для рекламы','new':'Новые в подписке','watch':'Отслеживаемые фильмы'}[view]
-    descriptions = {'catalog':'Один список с разными способами просмотра.',
-                    'signals':'Спрос выше 50 000 и рост за последние 7 дней. Только однозначные запросы.',
-                    'watch':'Любые фильмы, даже вне каталога TVOЁ. Wordstat проверяется при добавлении и затем раз в сутки в пределах лимитов.',
-                    'new':'Добавления остаются здесь до отметки «Проверено». Рост спроса отслеживается и после проверки.'}
-    controls = f'<div class="modes" aria-label="Сортировка каталога">{mode_links}</div>' if view=='catalog' else ''
-    searched = escape(query,quote=True)
-    form = (f'<form action="/" method="get"><input type="hidden" name="view" value="{view}">'
-            + (f'<input type="hidden" name="mode" value="{mode}">' if view=='catalog' else '')
-            + f'<input type="search" name="q" value="{searched}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button type="submit">Найти</button></form>')
-    if view=='watch':
-        controls = (f'<form class="watch-add" action="/watch" method="post">{csrf_field}'
-                    '<label for="watch-title">Добавить фильм</label>'
-                    '<input id="watch-title" name="title" maxlength="160" required placeholder="Название фильма" aria-label="Название фильма">'
-                    '<button type="submit">Следить</button></form>')
-    errors = store.meta('last_errors','')
-    error_notice = '<p class="notice">Часть данных не обновилась. Показаны последние сохранённые значения.</p>' if errors else ''
-    summary = ('<strong>' + (f'{len(signal_rows)} сигналов для проверки рекламы' if signal_rows else 'Сигналов для рекламы пока нет') + '</strong>'
-               '<span>Критерий: более 50 000 запросов и растущий спрос</span>')
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{heading} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}.watch-add{{display:flex;flex-wrap:wrap;gap:8px;width:100%}}.watch-add label{{flex-basis:100%}}.watch-add input{{flex:1;min-width:120px;width:auto}}.watch-add button{{flex-shrink:0}}@media(max-width:700px){{nav{{flex-wrap:wrap;gap:4px 18px}}}}</style></head>
-<body><header><div class="head"><a class="brand" href="/">TVO<span>Ё</span><small>Аналитика спроса</small></a><div class="stamp">Данные TVOЁ и Wordstat<strong>{escape(updated_text)}</strong></div></div></header>
-<main><section class="hero"><div><h1>Скоро в подписке</h1><p>Контент TVOЁ и поисковый спрос в одном рабочем списке.</p></div><div class="hero-facts"><strong>{len(all_rows)} тайтлов · {checked} проверено</strong><span>Коллекция проверяется каждый час, Wordstat - раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section>
-<a class="signal-summary{" has-signals" if signal_rows else ""}" href="/?view=signals"><div>{summary}</div><b>Открыть →</b></a>
-<nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{heading}</h2><p>{descriptions[view]}</p></div>
-<div class="controls">{controls}{form}</div>{error_notice}{content}
-<p class="notice">Wordstat показывает количество поисковых запросов по фразе, а не просмотры фильма. Общие названия помечены как неоднозначные. Сигнал помогает выбрать тайтл для проверки рекламной гипотезы, а не гарантирует результат кампании.</p></main></body></html>'''
+DASHBOARD_CSS = '''
+:root{--bg:#f7f8f6;--white:#fff;--ink:#172421;--muted:#69746e;--line:#dfe5df;--green:#125b43;--soft:#e9f5ed;--warn:#fff2df;--red:#9a403d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green)}button,input,select{font:inherit}button,.button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 16px;border-radius:10px;border:1px solid var(--green);background:var(--green);color:white;font-weight:650;text-decoration:none;text-align:center}button.secondary,.button.secondary{background:white;color:var(--ink);border-color:var(--line)}button:hover,.button:hover{filter:brightness(.94)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79b49a;outline-offset:3px}input,select{border:1px solid #cbd5cc;border-radius:9px;background:#fff;color:var(--ink);padding:10px 12px;min-height:44px;min-width:0;max-width:100%}form{margin:0}.head{max-width:1200px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:28px 24px 18px}.brand{font-size:30px;letter-spacing:-1px;font-weight:800;text-decoration:none;color:var(--ink)}.brand small{font-size:16px;font-weight:500;letter-spacing:0;color:var(--muted);display:block}.stamp{font-size:12px;color:var(--muted);text-align:right}.stamp strong{display:block;color:var(--ink);font-size:13px}main{max-width:1200px;margin:auto;padding:0 24px 56px}.hero{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:12px 0 22px}.hero h1{font-size:30px;letter-spacing:-.8px;line-height:1.18;margin:0 0 5px}.hero p,.section-head p{margin:0;color:var(--muted)}.hero-facts{display:flex;gap:10px;align-items:center}.hero-facts>span{font-size:12px;color:var(--muted);max-width:160px}nav{display:flex;gap:6px;background:white;border:1px solid var(--line);border-radius:13px;padding:7px;margin-bottom:24px}.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 8px;border-radius:9px;text-decoration:none;color:var(--ink);white-space:nowrap;font-weight:600}.tab.active{background:var(--green);color:#fff}.tab small{font-size:11px;opacity:.7}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:18px}.section-head h2{font-size:23px;margin:0;letter-spacing:-.5px}.section-head p{max-width:540px;font-size:13px}.controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}.controls form{display:flex;gap:8px}.controls input[type=search]{width:230px}.modes{display:flex;flex-wrap:wrap;gap:7px}.mode{display:block;padding:8px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px}.mode.active{background:var(--green);color:white;border-color:var(--green)}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.entry{border:1px solid var(--line);border-radius:15px;background:#fff;padding:20px;min-width:0}.card-top{display:grid;grid-template-columns:80px minmax(0,1fr);gap:16px}.poster{width:80px;height:112px;border-radius:9px;object-fit:cover;background:#ecf0eb}.poster-placeholder{display:flex;align-items:center;justify-content:center;color:var(--green);font-size:32px;font-weight:700}.title{font-size:19px;line-height:1.3;margin:0 0 7px;overflow-wrap:anywhere}.title a{text-decoration:none;color:var(--ink)}.detail{font-size:12px;color:var(--muted);margin-bottom:9px;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:4px 8px;font-size:12px;font-weight:600;margin:2px 4px 6px 0;background:#edf0ed;color:var(--muted)}.badge.available{background:#dff3e5;color:var(--green)}.badge.soon,.badge.warn{background:var(--warn);color:#87551d}.badge.fall{background:#fbe9e7;color:var(--red)}.demand{font-weight:750;font-size:21px;line-height:1.4}.demand small{font-size:12px;font-weight:400;color:var(--muted)}.trend{color:var(--green);font-size:15px;font-weight:700}.fall-text{color:var(--red)}.spark{display:block;width:100%;height:68px;margin:12px 0 4px;color:var(--green)}.spark.falling{color:var(--red)}.data-date{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions form{display:inline-flex}.actions button,.actions .button{font-size:12px;padding:9px 12px}.analysis{margin-top:13px;border-top:1px solid var(--line);padding-top:10px;font-size:12px;overflow-wrap:anywhere}.analysis summary{cursor:pointer;color:var(--muted);min-height:34px;padding:5px 0}.analysis p{color:var(--muted)}.analysis .data-error{color:var(--red)}.demand-chart{width:100%;height:120px;color:var(--green)}.edit-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.edit-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.edit-form .wide{grid-column:1/-1}.edit-form input,.edit-form select{width:100%}.edit-form button{justify-self:start}.watch-add{width:100%;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff;display:flex;gap:8px;flex-wrap:wrap}.watch-add label{width:100%;font-size:13px;font-weight:600}.watch-add input{flex:1;width:auto;min-width:120px}.empty{padding:32px;border:1px dashed var(--line);border-radius:12px;grid-column:1/-1;color:var(--muted);background:#fff}.empty strong{display:block;margin-bottom:6px;color:var(--ink)}.notice{font-size:12px;line-height:1.6;color:var(--muted);margin:18px 0}.status-notice{background:#fff8e9;border:1px solid #e6d8ba;border-radius:10px;padding:12px 16px}.source-list{margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;font-size:12px}.source-list summary{font-weight:600;cursor:pointer;min-height:30px}.source-row{display:flex;justify-content:space-between;align-items:start;gap:16px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px}.source-row span{color:var(--muted);text-align:right}.radar-card .title{font-size:18px}.radar-card .reason{color:var(--green);margin:8px 0}.lock{max-width:520px;margin:12vh auto;padding:28px}.lock h1{font-size:26px}.health-line{font-size:12px;color:var(--muted);margin-top:24px}.danger{color:var(--red)!important}.pagination{display:flex;gap:9px;justify-content:center;margin-top:20px}@media(max-width:760px){.head{padding:20px 16px 12px;align-items:start}.brand{font-size:25px}.brand small{font-size:12px}.stamp{font-size:10px;max-width:125px}.stamp strong{font-size:11px}main{padding:0 16px 40px}.hero{display:block;margin-top:14px}.hero h1{font-size:26px}.hero p{font-size:13px}.hero-facts{margin-top:14px}.hero-facts>span{max-width:none}nav{flex-wrap:wrap;gap:4px;padding:5px}.tab{flex:1 0 28%;padding:10px 5px;font-size:12px}.section-head{display:block}.section-head p{margin-top:6px}.controls{display:block}.controls>form{margin-top:12px;width:100%}.controls input[type=search]{width:auto;flex:1}.modes{margin-bottom:12px}.list{grid-template-columns:1fr}.entry{padding:16px}.card-top{grid-template-columns:68px minmax(0,1fr);gap:12px}.poster{width:68px;height:96px}.title{font-size:17px}.demand{font-size:19px}.actions{gap:7px}.source-row{display:block}.source-row span{display:block;text-align:left;margin-top:3px}.watch-add input{flex-basis:55%}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+'''
+
+
+def short_date(value):
+    if not value:return 'ещё нет данных'
+    try:return datetime.fromisoformat(str(value).replace('Z','+00:00')).astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y')
+    except ValueError:return str(value)[:10]
+
+
+def sparkline(row):
+    try:points=json.loads(row.get('dynamics_json') or '[]')
+    except (ValueError,TypeError):return ''
+    values=[]
+    for p in points:
+        try:
+            d=date.fromisoformat(str(p['date'])[:10]);n=int(p['count'])
+            if d<datetime.now(UTC).date() and n>=0:values.append((d,n))
+        except (ValueError,TypeError,KeyError):pass
+    values=sorted(dict(values).items())[-14:]
+    if len(values)<2:return ''
+    peak=max(1,max(n for _,n in values));span=max(1,(values[-1][0]-values[0][0]).days);commands=[];old=None
+    for d,n in values:
+        commands.append(('M' if old is None or (d-old).days!=1 else 'L')+f'{4+(d-values[0][0]).days*312/span:.1f},{60-n*52/peak:.1f}');old=d
+    return f'<svg class="spark {"falling" if row["trend"]=="падает" else ""}" viewBox="0 0 320 68" role="img" aria-label="Динамика спроса"><path d="{" ".join(commands)}" fill="none" stroke="currentColor" stroke-width="2.5"/></svg>'
+
+
+def availability_badge(store,row):
+    d=detail_for(store,row);state=d['availability']
+    labels={'available':'В подписке TVOЁ','soon':'Скоро'+(' · '+short_date(row['poster_date']) if row['poster_date'] else ''),'unknown':'Доступность не подтверждена','unavailable':'Недоступен в TVOЁ'}
+    return f'<span class="badge {"available" if state=="available" else "soon" if state=="soon" else ""}">{html.escape(labels[state])}</span>'
+
+
+def action_form(path, csrf, fields, label, secondary=False):
+    hidden=''.join(f'<input type="hidden" name="{html.escape(k,quote=True)}" value="{html.escape(str(v),quote=True)}">' for k,v in fields.items())
+    return f'<form action="{path}" method="post">{csrf}{hidden}<button class="{"secondary" if secondary else ""}" type="submit">{label}</button></form>'
+
+
+def film_card(store,row,view,csrf,watched,promoted):
+    esc=html.escape;d=detail_for(store,row);c=demand_comparison(row);is_fresh=signal_fresh(store,row,c)
+    title=esc(row['title']);url=row.get('url') or ''
+    url='https://tvoe.live'+url if url.startswith('/') and not url.startswith('//') else safe_url(url)
+    heading=f'<a href="{esc(url,quote=True)}" target="_blank" rel="noopener noreferrer">{title}</a>' if url else title
+    poster=safe_url(d.get('poster',''))
+    picture=(f'<img class="poster" src="{esc(poster,quote=True)}" alt="Постер: {esc(row["title"],quote=True)}" loading="lazy" referrerpolicy="no-referrer">' if poster else f'<div class="poster poster-placeholder" aria-hidden="true">{esc(row["title"][:1].upper())}</div>')
+    count=f'{row["total_count"]:,}'.replace(',',' ') if row['total_count'] is not None else 'Ожидает проверки'
+    pct=(f'{c["percent"]:+.1f}%' if c and c['percent'] is not None else '')
+    kind='Сериал' if row['type']=='serials' else 'Фильм'
+    subtitle=kind+(' · '+d['year'] if d.get('year') else '')
+    badges=availability_badge(store,row)
+    if row['ambiguous']:badges+='<span class="badge warn">Уточните запрос</span>'
+    if c and not is_fresh:badges+='<span class="badge warn">Динамика устарела</span>'
+    if view=='new':badges+='<span class="badge available">Опубликован · '+esc(short_date(d.get('available_at')))+' </span>'
+    if row['id'] in promoted:badges+='<span class="badge">В рекламе</span>'
+    change=f' <span class="trend {"fall-text" if c and c["delta"]<0 else ""}">{pct}</span>' if pct else ''
+    controls=''
+    if url:controls+=f'<a class="button secondary" href="{esc(url,quote=True)}" target="_blank" rel="noopener noreferrer">Открыть фильм</a>'
+    if row['id'] not in watched:controls+=action_form('/watch',csrf,{'id':row['id']},'Следить',True)
+    elif view=='watch':controls+=action_form('/unwatch',csrf,{'id':row['id']},'Убрать из списка',True)
+    if row['id'] not in promoted:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'1'},'В рекламу')
+    else:controls+=action_form('/promotion',csrf,{'id':row['id'],'active':'0'},'Убрать из рекламы',True)
+    if view=='new':controls+=action_form('/review',csrf,{'id':row['id']},'✓ Проверено',True)
+    if view=='ads' and c and c['percent'] is not None and c['percent']<=-30 and is_fresh:
+        controls+='<span class="badge fall">Спрос падает · проверьте кампанию</span>'
+    edit=(f'<details class="analysis"><summary>Уточнить фильм и доступность</summary><form class="edit-form" action="/film" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}"><input type="hidden" name="return" value="{view}">'
+          f'<label>Тип<select name="type" aria-label="Тип"><option value="films" {"selected" if kind=="Фильм" else ""}>Фильм</option><option value="serials" {"selected" if kind=="Сериал" else ""}>Сериал</option></select></label>'
+          f'<label>Год<input name="year" inputmode="numeric" maxlength="4" value="{esc(d.get("year") or "",quote=True)}" placeholder="Например, 2026"></label>'
+          '<label class="wide">Доступность в TVOЁ<select name="availability" aria-label="Доступность в TVOЁ">'+''.join(f'<option value="{key}" {"selected" if d["availability"]==key else ""}>{label}</option>' for key,label in [('unknown','Не подтверждена'),('available','Доступен в подписке'),('soon','Скоро'),('unavailable','Недоступен')])+'</select></label>'
+          f'<label class="wide">Подтверждённый запрос Wordstat<input name="query" maxlength="180" value="{esc(d.get("query_override") or "",quote=True)}" placeholder="Название + фильм / сериал / год"></label>'
+          '<p class="notice wide">Подтверждайте доступность после проверки карточки TVOЁ. Уточнение запроса сохраняет старую историю отдельно.</p><button type="submit">Сохранить</button></form></details>')
+    date_info=(f'Последние данные · {short_date(c["to"])} · два полных периода по 7 дней' if c else 'Динамика ещё не получена')
+    return (f'<article class="entry"><div class="card-top">{picture}<div><h3 class="title">{heading}</h3><div class="detail">{esc(subtitle)}</div>{badges}<div class="demand">{count}<small>{" запросов / 30 дней" if row["total_count"] is not None else ""}</small>{change}</div><div class="detail">Wordstat проверен · {esc(short_date(row["measured_at"]))}</div></div></div>'
+            +sparkline(row)+f'<div class="data-date">{esc(date_info)}</div><div class="actions">{controls}</div>'+title_analysis(store,row,csrf)+edit+'</article>')
+
+
+def source_status(store):
+    with store.lock:sources=[dict(r) for r in store.db.execute('SELECT * FROM radar_sources ORDER BY id')]
+    rows=[]
+    for source in sources:
+        text=('Временно недоступен' if source['error'] else 'Проверка ещё не выполнена' if not source['success_at'] else 'Получены данные · '+short_date(source['success_at']))
+        rows.append(f'<div class="source-row"><a href="{html.escape(source["url"],quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(source["name"])}</a><span>{text}</span></div>')
+    return '<details class="source-list" open><summary>Источники и обновление</summary>'+''.join(rows)+'</details>'
+
+
+def radar_card(row,csrf):
+    esc=html.escape
+    confirmed=row.get('confirmed_id')
+    state=('Фильм подтверждён · добавлен в «Следить»' if confirmed else 'Название найдено в каталоге · проверьте совпадение' if row.get('match_id') else 'Совпадение требует проверки')
+    form='' if confirmed else (f'<details class="analysis"><summary>Подтвердить фильм</summary><form class="edit-form" action="/radar-confirm" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}">'
+          f'<label class="wide">Название<input name="title" maxlength="160" required value="{esc(row["title"],quote=True)}"></label><label>Год<input name="year" maxlength="4" inputmode="numeric"></label><label>Тип<select name="type" aria-label="Тип"><option value="films">Фильм</option><option value="serials">Сериал</option></select></label><button class="wide" type="submit">Подтвердить и следить</button></form></details>')
+    return (f'<article class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+'</div>'+form+'</article>')
+
+
+def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
+    esc=html.escape;csrf_field=f'<input type="hidden" name="csrf" value="{esc(csrf,quote=True)}">'
+    legacy={'soon':('catalog','soon'),'top':('catalog','top'),'growth':('catalog','growth')}
+    view,mode=legacy.get(view,(view,mode));view=view if view in ('catalog','new','signals','watch','radar','ads') else 'catalog'
+    if mode=='date':mode='all'
+    all_rows=store.rows('title ASC','status!="watched"',10000)
+    new_rows=store.new_rows();watch_rows=store.watch_rows();ad_rows=promotion_rows(store);signals=growth_rows(store);early=growth_rows(store,True);radar=radar_rows(store)
+    watched={r['id'] for r in watch_rows};promoted={r['id'] for r in ad_rows}
+    tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
+    links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
+    headings={'catalog':'Каталог тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы','radar':'Радар интереса · Россия','ads':'Фильмы и сериалы в рекламе'}
+    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Подтверждённо доступны и ожидают вашей проверки.','signals':'Свежие данные Wordstat. Ранний рост показываем без рекламных уведомлений.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Публикации и поисковые тренды. Упоминание не подтверждает рост спроса.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
+    rows={'catalog':all_rows,'new':new_rows,'signals':early if mode=='early' else signals,'watch':watch_rows,'radar':radar,'ads':ad_rows}[view]
+    if view=='catalog':
+        if mode in ('available','soon','unknown'):rows=[r for r in rows if detail_for(store,r)['availability']==mode]
+        elif mode=='top':rows=sorted(rows,key=lambda r:r['total_count'] or 0,reverse=True)
+        elif mode=='growth':rows=sorted([r for r in rows if signal_fresh(store,r) and r['trend']=='растёт'],key=lambda r:r['delta'] or 0,reverse=True)
+    if query:rows=[r for r in rows if query.casefold() in (r['title']).casefold()]
+    filters=[('all','Все'),('available','Доступен'),('soon','Скоро'),('unknown','Не подтверждены'),('top','По спросу'),('growth','Растут')] if view=='catalog' else [('all','Выше 50 000'),('early','Начинают расти')] if view=='signals' else []
+    controls='<div class="modes">'+''.join(f'<a class="mode {"active" if mode==key else ""}" href="/?view={view}&amp;mode={key}">{label}</a>' for key,label in filters)+'</div>' if filters else ''
+    search=f'<form action="/" method="get"><input type="hidden" name="view" value="{view}"><input type="hidden" name="mode" value="{esc(mode,quote=True)}"><input type="search" name="q" value="{esc(query,quote=True)}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button class="secondary" type="submit">Найти</button></form>'
+    add=''
+    if view in ('watch','ads'):
+        path='/watch' if view=='watch' else '/promotion'
+        label='Добавить фильм или сериал' if view=='watch' else 'Добавить тайтл в рекламу'
+        button='Следить' if view=='watch' else 'В рекламу'
+        add=f'<form class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><button type="submit">{button}</button></form>'
+    entries=''.join(radar_card(row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:100])
+    empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет свежих сигналов по выбранным условиям. Старые данные не считаются текущим ростом.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
+    if not entries:entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
+    notices=''
+    if view=='catalog' and not store.meta('catalog_feed_updated',''):notices='<p class="notice status-notice">Полный каталог TVOЁ пока не подключён. Сохраняем тайтлы из «Скоро», даже когда они исчезают из раздела. Доступность подтверждается отдельно.</p>'
+    if view=='catalog':
+        notices+=(f'<details class="analysis source-list"><summary>Загрузить фид каталога TVOЁ</summary><form class="watch-add" action="/catalog-feed" method="post" enctype="multipart/form-data">{csrf_field}<label for="catalog-feed">Файл каталога TVOЁ · YML/XML</label><input id="catalog-feed" name="feed" type="file" accept=".xml,.yml,text/xml" required><button type="submit">Загрузить каталог</button></form><p class="notice">Первый импорт создаёт базовый каталог без массовых уведомлений. В дальнейшем новые доступные тайтлы попадают в «Новое». Используйте фид TVOЁ, где available означает фактическую доступность для просмотра.</p></details>')
+        if store.meta('catalog_feed_error',''):notices+='<p class="notice status-notice">Не удалось обновить фид каталога. Последние данные сохранены.</p>'
+    if view=='ads':notices+='<p class="notice">Предупреждение: падение не менее 30% на двух разных последовательных датах данных. Повторная загрузка одной даты не считается подтверждением. Даже при спросе ниже 50 000. Реклама автоматически не отключается.</p>'
+    if view=='radar':notices+=source_status(store)+'<p class="notice">Читаем доступные публичные ленты, без входа в закрытые каналы и без обхода защиты. Новые названия подтверждаются вручную перед проверкой Wordstat.</p>'
+    if store.meta('last_errors',''):notices+='<p class="notice status-notice">Часть данных не обновилась. Последние сохранённые значения доступны в карточках.</p>'
+    updated=esc(short_date(store.meta('last_tvoe','')))
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Фильмы, интерес к которым растёт</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat раз в сутки</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
 
 
 def start_dashboard(store, secret, allowed_id, port, app=None):
@@ -833,19 +1257,88 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review','/ad','/watch'):
+            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
                     size = int(self.headers.get('Content-Length','0'))
-                    if size < 0 or size > (16384 if path == '/ad' else 4096):
+                    if size < 0 or size > (8_100_000 if path=='/catalog-feed' else 16384 if path == '/ad' else 4096):
                         return self.respond(413)
-                    fields = parse_qs(self.rfile.read(size).decode('utf-8'))
+                    raw=self.rfile.read(size)
+                    if path=='/catalog-feed':
+                        from email.parser import BytesParser
+                        from email.policy import default
+                        content_type=self.headers.get('Content-Type','')
+                        if not content_type.startswith('multipart/form-data;'):return self.respond(400)
+                        message=BytesParser(policy=default).parsebytes(('Content-Type: '+content_type+'\r\nMIME-Version: 1.0\r\n\r\n').encode()+raw)
+                        fields={}
+                        for part in message.iter_parts():
+                            name=part.get_param('name',header='content-disposition')
+                            if name in ('csrf','feed'):fields[name]=[(part.get_payload(decode=True) or b'').decode('utf-8-sig')]
+                    else:
+                        fields = parse_qs(raw.decode('utf-8'))
                 except (ValueError,UnicodeError):
                     return self.respond(400)
                 if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
                     return self.respond(403)
-                if path == '/ad':
+                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed'):
+                    fields={k:v[0] for k,v in fields.items()}
+                    ident=fields.get('id','')
+                    refresh_id=None
+                    try:
+                        if path=='/catalog-feed':
+                            try:import_catalog_feed(store,fields.get('feed',''))
+                            except ET.ParseError:raise ValueError('Не удалось прочитать XML. Проверьте файл.')
+                            store.set_meta('catalog_feed_error','')
+                            if app is not None:
+                                try:app.send_new_alerts()
+                                except RuntimeError:pass
+                            target='/?view=catalog&saved=feed'
+                        elif path=='/promotion':
+                            active=fields.get('active')
+                            if active not in ('0','1'): raise ValueError('Выберите действие.')
+                            if not ident:
+                                ident,added=store.add_watch(fields.get('title',''))
+                                refresh_id=ident if added else None
+                            set_promotion(store,ident,active=='1')
+                            if active=='1': refresh_id=ident
+                            target='/?view=ads&saved=promotion'
+                        elif path=='/unwatch':
+                            with store.lock,store.db:
+                                store.db.execute('DELETE FROM watchlist WHERE title_id=?',(ident,))
+                            target='/?view=watch&saved=unwatch'
+                        elif path=='/film':
+                            with store.lock,store.db:
+                                row=store.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()
+                                if not row: raise ValueError('Фильм не найден.')
+                                kind=fields.get('type','films');query=fields.get('query','').strip()
+                                if kind not in ('films','serials') or len(query)>180 or any(ord(c)<32 for c in query):raise ValueError('Проверьте тип и запрос.')
+                                old=detail_for(store,dict(row)).get('query_override') or ''
+                                set_availability(store,ident,fields.get('availability','unknown'),year=fields.get('year','').strip())
+                                store.db.execute('UPDATE titles SET type=? WHERE id=?',(kind,ident))
+                                store.db.execute('UPDATE film_details SET query_override=? WHERE title_id=?',(query,ident))
+                                if old!=query or row['type']!=kind:
+                                    store.db.execute('UPDATE titles SET measured_at=NULL,total_count=NULL,dynamics_json=NULL,trend=NULL,delta=NULL,ambiguous=0 WHERE id=?',(ident,))
+                                    store.set_meta('dynamics_checked:'+ident,'')
+                                    store.set_meta('growth_alert:'+ident,'quiet')
+                                    store.db.execute('DELETE FROM decline_state WHERE title_id=?',(ident,))
+                                    refresh_id=ident
+                            if app is not None:
+                                try: app.send_new_alerts()
+                                except RuntimeError: pass
+                            view=fields.get('return','catalog')
+                            if view not in ('catalog','new','signals','watch','ads'):view='catalog'
+                            target='/?view='+view+'&saved=film'
+                        elif path=='/radar-confirm':
+                            refresh_id,added=confirm_radar(store,ident,fields.get('title',''),fields.get('year','').strip(),fields.get('type','films'))
+                            target='/?view=watch&saved=radar'
+                        else:
+                            with store.lock,store.db:store.db.execute('UPDATE radar_items SET dismissed=1 WHERE id=?',(ident,))
+                            target='/?view=radar&saved=hidden'
+                        if refresh_id and app is not None:app.refresh_async(notify=False,watch_id=refresh_id)
+                    except (ValueError,OverflowError) as exc:
+                        return self.respond(400,('<!doctype html><html lang="ru"><meta name="viewport" content="width=device-width,initial-scale=1"><p>'+html.escape(str(exc))+'</p><p><a href="/">Вернуться к списку</a></p></html>').encode())
+                elif path == '/ad':
                     try:
                         store.save_ad(fields.get('id',[''])[0], {k:v[0] for k,v in fields.items()})
                     except (ValueError,OverflowError):
@@ -900,18 +1393,20 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 mode = params.get('mode',['date'])[0]
                 query = params.get('q',[''])[0][:100].strip()
                 document = dashboard_document(store,view,query,nonce,mode,self.csrf_token())
+                if params.get('saved'):
+                    document=document.replace('<main>','<main><p class="notice status-notice" role="status">Изменения сохранены.</p>',1)
                 if params.get('watch') == ['saved']:
                     document = document.replace('<main>', '<main><p role="status">Фильм сохранён. Проверка Wordstat выполняется в фоне в пределах лимитов. Обновите страницу через некоторое время, чтобы увидеть результат.</p>', 1)
                 if params.get('refresh') == ['started']:
-                    document = document.replace('<main>', '<main><p role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
+                    document = document.replace('<main>', '<main><p class="notice status-notice" role="status">Обновление запрошено. Результат придёт в Telegram. После завершения перезагрузите страницу.</p>', 1)
                 body = document.encode('utf-8')
             else:
-                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}.watch-add{{display:flex;flex-wrap:wrap;gap:8px;width:100%}}.watch-add label{{flex-basis:100%}}.watch-add input{{flex:1;min-width:120px;width:auto}}.watch-add button{{flex-shrink:0}}@media(max-width:700px){{nav{{flex-wrap:wrap;gap:4px 18px}}}}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
+                body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Вход · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><main class="lock"><h1>Личный обзор TVOЁ</h1><p>Откройте бота в Telegram и отправьте <code>/web</code>. Он пришлёт временную ссылку для входа.</p></main><script nonce="{nonce}">if(location.hash.startsWith('#login=')){{const token=location.hash.slice(7);history.replaceState(null,'','/');fetch('/auth',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}}).then(r=>{{if(r.ok)location.reload();}});}}</script></body></html>'''.encode('utf-8')
             self.send_header('Content-Type','text/html; charset=utf-8')
             self.send_header('Content-Length',str(len(body)))
             self.send_header('Cache-Control','no-store')
             self.send_header('Referrer-Policy','no-referrer')
-            self.send_header('Content-Security-Policy',f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'")
+            self.send_header('Content-Security-Policy',f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'; img-src https:; base-uri 'none'")
             self.send_header('X-Content-Type-Options','nosniff')
             self.send_header('X-Frame-Options','DENY')
             self.end_headers()
@@ -930,14 +1425,28 @@ class BotApp:
         rows = self.store.pending_new()
         for offset in range(0,len(rows),8):
             batch = rows[offset:offset+8]
-            message = '🆕 Новое в «Скоро в подписке» TVOЁ:\n' + '\n'.join(
-                f'{r["title"]} - {r["poster_date"] or "дата не указана"}' for r in batch)
+            message = '🆕 Уже доступно в TVOЁ:\n' + '\n'.join(
+                f'{r["title"]} - доступность подтверждена' for r in batch)
             self.bot.send(message + '\nСписок сохранён в разделе «Новое» до вашей проверки рекламы.', MENU)
             with self.store.lock, self.store.db:
                 self.store.db.executemany('UPDATE review_queue SET notified_at=? WHERE title_id=?', [(now(),r['id']) for r in batch])
 
+    def send_decline_alerts(self):
+        for row in pending_declines(self.store):
+            c=row['comparison']
+            message=(f'📉 В рекламе: {row["title"]}\n'
+                     f'Спрос снизился на {abs(c["percent"]):.1f}%: {c["older"]:,} → {c["newer"]:,} запросов.\n'
+                     f'Два полных периода по 7 дней, по {c["to"]}. Снижение подтверждено на двух разных датах данных.\n'
+                     'Проверьте кампанию: возможно, стоит сократить продвижение или убрать тайтл. Реклама автоматически не отключается.')
+            self.bot.send(message,MENU)
+            with self.store.lock,self.store.db:
+                self.store.db.execute('UPDATE decline_state SET notified=1 WHERE title_id=?',(row['id'],))
+
     def send_growth_alerts(self, alerts):
-        for row in alerts:
+        pending={r['id']:{'id':r['id'],'title':r['title'],'count':r['total_count'],'delta':r['delta'],'query':r['wordstat_query']} for r in growth_rows(self.store) if self.store.meta('growth_alert:'+r['id'])!='sent'}
+        pending.update({r['id']:r for r in alerts})
+        for row in pending.values():
+            if self.store.meta('growth_alert:'+row['id'])=='sent':continue
             count = f'{row["count"]:,}'.replace(',',' ')
             delta = f'{row["delta"]:+,}'.replace(',',' ')
             message = (f'📈 Сигнал для проверки рекламы: {row["title"]}\n'
@@ -948,27 +1457,38 @@ class BotApp:
             self.bot.send(message,MENU)
             self.store.set_meta('growth_alert:'+row['id'],'sent')
 
+    def status_message(self,text,keyboard=None):
+        try: self.bot.send(text,keyboard)
+        except RuntimeError: pass  # A Telegram outage must not prevent a site refresh.
+
     def refresh_async(self, notify=True, watch_id=None):
         if watch_id is None and self.analyzer.lock.locked():
-            if notify: self.bot.send('Обновление уже выполняется.')
+            if notify: self.status_message('Обновление уже выполняется.')
             return
-        if notify: self.bot.send('🔄 Обновление запущено.')
+        if notify: self.status_message('🔄 Обновление запущено.')
         def run():
+            if watch_id is None:
+                try:refresh_radar(self.store)
+                except Exception as exc:print('Radar refresh error: '+type(exc).__name__,flush=True)
             # A manual addition waits behind an in-flight refresh instead of being lost.
             while True:
                 result = self.analyzer.refresh(watch_id=watch_id)
                 if watch_id is None or not result.get('busy'): break
                 time.sleep(1)
             if result.get('busy'):
-                if notify: self.bot.send('Обновление уже выполняется.')
+                if notify: self.status_message('Обновление уже выполняется.')
                 return
             if notify:
                 message = f'Обновление завершено. Новых: {len(result["new"])}; Wordstat: {result["measured"]}; динамика: {result["dynamics"]}.'
                 if result['errors']:
                     message += '\nЧасть данных не обновилась. Сохранённые значения доступны.'
-                self.bot.send(message, MENU)
-            self.send_growth_alerts(result['alerts'])
-        threading.Thread(target=run, daemon=True).start()
+                self.status_message(message, MENU)
+            for send in (lambda:self.send_growth_alerts(result['alerts']),self.send_decline_alerts):
+                try:send()
+                except RuntimeError:print('Telegram notification pending retry',flush=True)
+        worker=threading.Thread(target=run, daemon=True)
+        worker.start()
+        return worker
 
     def handle(self, update):
         if not authorized(update, self.bot.allowed):
@@ -990,12 +1510,19 @@ class BotApp:
         raw = raw or ''
         command = raw.split()[0].split('@')[0].lstrip('/').split(':', 1)[0] if raw else ''
         if raw in ('menu','start') or command == 'start':
-            self.bot.send('🎬 TVOЁ - спрос на контент «Скоро в подписке». Выберите раздел.', MENU)
+            self.bot.send('🎬 TVOЁ - спрос на фильмы и сериалы. Каталог, радар и реклама доступны через /web.', MENU)
         elif command in ('top','growth','soon','new'):
             try: page = int(raw.split(':',1)[1]) if ':' in raw else 0
             except ValueError: page = 0
             message, keyboard = render_list(self.store, command, page)
             self.bot.send(message, keyboard)
+        elif command in ('ads','watch'):
+            rows=promotion_rows(self.store) if command=='ads' else self.store.watch_rows()
+            heading='🎯 В рекламе' if command=='ads' else '👁 Отслеживаемые фильмы'
+            for offset in range(0,max(1,len(rows)),10):
+                batch=rows[offset:offset+10]
+                message=heading+'\n'+('\n'.join(f'{r["title"]}: {r["total_count"] if r["total_count"] is not None else "ожидает проверки"} · {r["trend"] or "нет динамики"}' for r in batch) or 'Список пока пуст. Добавьте тайтл на /web.')
+                self.bot.send(message[:4000],MENU)
         elif command == 'refresh':
             self.refresh_async()
         elif command == 'status':
@@ -1025,7 +1552,7 @@ class BotApp:
                 measurements = '\n'.join(f'{date_text(h["measured_at"])}: {h["total_count"]:,}'.replace(',', ' ') for h in history)
                 points = json.loads(row['dynamics_json']) if row.get('dynamics_json') else []
                 recent = ', '.join(f'{date_text(p.get("date"))}: {p.get("count")}' for p in points[-5:])
-                link = ('https://tvoe.live' + row['url']) if row.get('url','').startswith('/') else (row.get('url') or '')
+                link = ('https://tvoe.live' + row['url']) if (row.get('url') or '').startswith('/') else (row.get('url') or '')
                 self.bot.send(item_text(row)+'\nTVOЁ: '+(link or 'ссылка не указана')+'\nИстория:\n'+(measurements or 'нет')+'\nДинамика: '+(recent or 'нет')+'\n'+(row['query_note'] or ''))
         else:
             self.bot.send('Выберите команду в меню.', MENU)
@@ -1039,7 +1566,7 @@ class BotApp:
                     offset = update['update_id'] + 1
                     self.handle(update)
             except (RuntimeError, KeyError) as exc:
-                print('Bot polling error: '+type(exc).__name__, flush=True)
+                print('Bot polling error: '+(str(exc) if isinstance(exc,RuntimeError) and str(exc).startswith('Telegram ') else type(exc).__name__), flush=True)
                 time.sleep(5)
 
 
@@ -1062,9 +1589,11 @@ def main():
                     result = analyzer.refresh()
                     if not result.get('busy'):
                         app.send_growth_alerts(result['alerts'])
-                        next_analysis = time.monotonic() + 86400
+                        app.send_decline_alerts()
+                        next_analysis = time.monotonic() + (3600 if result['errors'] else 86400)
                 elif analyzer.lock.acquire(blocking=False):
                     try:
+                        refresh_catalog_feed(store)
                         store.sync(fetch_tvoe_items(analyzer.transport))
                         app.send_new_alerts()
                     finally:
@@ -1072,12 +1601,19 @@ def main():
             except Exception as exc:
                 print('Scheduled refresh failed: '+type(exc).__name__, flush=True)
             time.sleep(3600)
+    def radar_schedule():
+        while True:
+            try: refresh_radar(store)
+            except Exception as exc: print('Radar refresh error: '+type(exc).__name__,flush=True)
+            time.sleep(1800)
+    threading.Thread(target=radar_schedule,daemon=True).start()
     threading.Thread(target=schedule,daemon=True).start()
     app.loop()
 
 
 if __name__ == '__main__':
     main()
+
 
 
 
