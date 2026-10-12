@@ -665,6 +665,11 @@ def import_radar(store, source, items):
                 stable=hashlib.sha256((source['id']+'|'+item['url']+'|'+name_key(title)+'|'+published).encode()).hexdigest()
                 cur=store.db.execute('INSERT OR IGNORE INTO radar_items(id,source_id,url,title,reason,published_at,found_at,match_id) VALUES(?,?,?,?,?,?,?,?)',(stable,source['id'],item['url'],title[:160],reason_for(item['text'],source['id']=='google_ru'),published,stamp,ident))
                 added+=cur.rowcount
+                # Keep only structured identity hints, never the full publication.
+                if cur.rowcount:
+                    kinds={k.lower() for k in re.findall(r'\b(фильм|сериал)(?:а|е|ом|у)?\b',item['text'],re.I)}
+                    if len(kinds)==1:
+                        store.set_meta('radar_kind:'+stable,'serials' if next(iter(kinds)).lower()=='сериал' else 'films')
     return added
 
 
@@ -672,6 +677,41 @@ def radar_rows(store):
     cutoff=(datetime.now(UTC)-timedelta(days=7)).isoformat()
     with store.lock:
         return [dict(r) for r in store.db.execute('SELECT r.*,s.name source_name FROM radar_items r JOIN radar_sources s ON s.id=r.source_id WHERE r.dismissed=0 AND COALESCE(NULLIF(r.published_at,""),r.found_at)>=? ORDER BY r.found_at DESC LIMIT 100',(cutoff,))]
+
+
+def auto_track_radar(store):
+    """Discover candidates within existing Wordstat budgets, without claiming availability."""
+    grouped={}
+    for row in radar_rows(store):
+        if row['confirmed_id']:continue
+        grouped.setdefault(name_key(row['title']),[]).append(row)
+    added=0
+    for rows in grouped.values():
+        # Known catalogue IDs are safe; unknown works require independent sources
+        # and consistent film/series context. Google News is an aggregator.
+        known={r['match_id'] for r in rows if r['match_id']}
+        if len(known)>1:continue
+        kinds={store.meta('radar_kind:'+r['id'],'') for r in rows}-{''}
+        independent={r['source_id'] for r in rows if r['source_id']!='google_news'}
+        if known:
+            ident=next(iter(known))
+            if store.meta('auto_radar_seen:'+ident,''):continue
+            ident,new=store.add_watch(ident=ident)
+        else:
+            if len(independent)<2 or len(kinds)!=1:continue
+            # Do not choose among remakes or overwrite a manually identified title.
+            matches=[r for r in store.rows('title ASC','1=1',10000) if name_key(r['title'])==name_key(rows[0]['title'])]
+            if matches:continue
+            ident,new=store.add_watch(rows[0]['title'])
+            kind=next(iter(kinds))
+            with store.lock,store.db:
+                store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(kind,ident))
+        with store.lock,store.db:
+            store.set_meta('auto_radar_seen:'+ident,now())
+            store.set_meta('auto_radar:'+ident,'Найден автоматически по источникам. Доступность TVOЁ не подтверждена.')
+            for row in rows:store.db.execute('UPDATE radar_items SET confirmed_id=? WHERE id=?',(ident,row['id']))
+        added+=int(new)
+    return added
 
 
 def refresh_radar(store, transport=bounded_text):
@@ -701,6 +741,7 @@ def _refresh_radar(store, transport=bounded_text):
                 continue
             radar_error(store,source,stamp)
         except (URLError,OSError,TimeoutError,ValueError,ET.ParseError,UnicodeError):radar_error(store,source,stamp)
+    auto_track_radar(store)
     return added
 
 
@@ -820,6 +861,7 @@ class Analyzer:
                     return stats
                 self.store.set_meta(quota_key,used+1)
             if watch_id is None:
+                auto_track_radar(self.store)
                 try:
                     refresh_catalog_feed(self.store)
                     items = fetch_tvoe_items(self.transport)
@@ -867,7 +909,7 @@ class Analyzer:
                           and not fresh(self.store.meta('dynamics_checked:'+r['id'],''))]
             if any('HTTP 429' in e for e in stats['errors']) or self.store.meta('wordstat_retry_at','')>now(): candidates=[]
             # Rotate through eligible titles across days, including ones not measured in this pass.
-            candidates.sort(key=lambda row: (row['id'] not in promoted,self.store.meta('dynamics_checked:'+row['id'],''),
+            candidates.sort(key=lambda row: (row['id'] not in promoted,(row['total_count'] or 0)<=50000,self.store.meta('dynamics_checked:'+row['id'],''),
                                              -(row['total_count'] or 0)))
             for row in candidates[:self.dynamics_budget]:
                 try:
@@ -1175,7 +1217,7 @@ def source_status(store):
 def radar_card(row,csrf):
     esc=html.escape
     confirmed=row.get('confirmed_id')
-    state=('Фильм подтверждён · добавлен в «Следить»' if confirmed else 'Название найдено в каталоге · проверьте совпадение' if row.get('match_id') else 'Совпадение требует проверки')
+    state=('Название отслеживается · спрос проверяет Wordstat' if confirmed else 'Название найдено в каталоге · проверьте совпадение' if row.get('match_id') else 'Совпадение требует проверки')
     form='' if confirmed else (f'<details class="analysis"><summary>Подтвердить фильм</summary><form class="edit-form" action="/radar-confirm" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}">'
           f'<label class="wide">Название<input name="title" maxlength="160" required value="{esc(row["title"],quote=True)}"></label><label>Год<input name="year" maxlength="4" inputmode="numeric"></label><label>Тип<select name="type" aria-label="Тип"><option value="films">Фильм</option><option value="serials">Сериал</option></select></label><button class="wide" type="submit">Подтвердить и следить</button></form></details>')
     return (f'<article class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+'</div>'+form+'</article>')
@@ -1192,7 +1234,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
     tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
     links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
     headings={'catalog':'Каталог тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы','radar':'Радар интереса · Россия','ads':'Фильмы и сериалы в рекламе'}
-    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Подтверждённо доступны и ожидают вашей проверки.','signals':'Свежие данные Wordstat. Ранний рост показываем без рекламных уведомлений.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Публикации и поисковые тренды. Упоминание не подтверждает рост спроса.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
+    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Подтверждённо доступны и ожидают вашей проверки.','signals':'Свежие данные Wordstat. Ранний рост показываем без рекламных уведомлений.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
     rows={'catalog':all_rows,'new':new_rows,'signals':early if mode=='early' else signals,'watch':watch_rows,'radar':radar,'ads':ad_rows}[view]
     if view=='catalog':
         if mode in ('available','soon','unknown'):rows=[r for r in rows if detail_for(store,r)['availability']==mode]
