@@ -117,7 +117,7 @@ def normalize_item(item):
     url = item.get('url')
     if not ident:
         ident = 'name:' + name.strip().casefold() + ':' + str(kind or '')
-    return {'id': str(ident), 'title': name.strip(), 'type': kind, 'genre': item.get('genreName'), 'poster_date': item.get('posterDate'), 'url': url, 'seasons_count': item.get('seasonsCount')}
+    return {'id': str(ident), 'title': name.strip(), 'type': kind, 'genre': item.get('genreName'), 'poster_date': item.get('posterDate'), 'url': url, 'seasons_count': item.get('seasonsCount'), 'year':str(item.get('year') or '') if str(item.get('year') or '').isdigit() and 1880<=int(item['year'])<=datetime.now(UTC).year+10 else ''}
 
 
 def kind_suffix(kind):
@@ -245,6 +245,8 @@ class Store:
             self.db.execute('CREATE TABLE IF NOT EXISTS watchlist (title_id TEXT PRIMARY KEY, name_key TEXT UNIQUE NOT NULL, added_at TEXT NOT NULL)')
 
             film_schema(self)
+            self.origin_lock=threading.Lock()
+            if 'family' not in {r[1] for r in self.db.execute('PRAGMA table_info(title_origin)')}:self.db.execute('ALTER TABLE title_origin ADD COLUMN family TEXT')
 
             # Recalculate current classification from saved points, preserving history.
             for row in self.db.execute('SELECT id,dynamics_json FROM titles WHERE dynamics_json IS NOT NULL').fetchall():
@@ -317,14 +319,14 @@ class Store:
         return all_tracking(self)
 
     def new_rows(self):
-        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if detail_for(self,r)['availability']=='available' and not self.meta('feed_baseline:'+r['id'],'')]
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if foreign_title(self,r) and detail_for(self,r)['availability']=='available' and not self.meta('feed_baseline:'+r['id'],'')]
 
     def mark_reviewed(self, ident):
         with self.lock, self.db:
             self.db.execute('UPDATE review_queue SET reviewed_at=? WHERE title_id=?', (now(),ident))
 
     def pending_new(self):
-        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if detail_for(self,r)['availability']=='available']
+        return [r for r in self.rows('first_seen DESC', 'id IN (SELECT title_id FROM review_queue WHERE notified_at IS NULL) AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if foreign_title(self,r) and detail_for(self,r)['availability']=='available']
 
     def meta(self, key, default=None):
         with self.lock:
@@ -358,6 +360,8 @@ class Store:
                             self.db.execute('INSERT INTO events(title_id,at,kind,detail) VALUES(?,?,?,?)', (item['id'],timestamp,'changed',field))
                     self.db.execute('UPDATE titles SET title=?,type=?,genre=?,poster_date=?,url=?,seasons_count=?,last_seen=?,status="active" WHERE id=?', (item['title'],item['type'],item['genre'],item['poster_date'],item['url'],str(item['seasons_count']) if item['seasons_count'] is not None else None,timestamp,item['id']))
                 self.db.execute('INSERT OR IGNORE INTO film_details(title_id,availability,evidence,updated_at) VALUES(?,"soon","Раздел Скоро TVOЁ",?)',(item['id'],timestamp))
+                if item.get('year'):
+                    self.db.execute('UPDATE film_details SET year=? WHERE title_id=? AND COALESCE(year,"")=""',(item['year'],item['id']))
                 self.db.execute('UPDATE film_details SET availability="soon",updated_at=? WHERE title_id=? AND availability="unknown" AND evidence="Раздел Скоро TVOЁ"',(timestamp,item['id']))
                 prior.pop(item['id'], None)
             for ident in prior:
@@ -392,7 +396,7 @@ class Store:
             return [dict(row) for row in self.db.execute(f'SELECT * FROM titles WHERE ({where}) AND id NOT IN (SELECT title_id FROM title_control WHERE deleted=1) ORDER BY {order} LIMIT ? OFFSET ?', (*params,limit,offset))]
 
     def find(self, term):
-        return self.rows('title ASC', 'title LIKE ?', 10, 0, ('%'+term+'%',))
+        return [r for r in self.rows('title ASC', 'title LIKE ?', 10, 0, ('%'+term+'%',)) if foreign_title(self,r)]
 
     def history(self, ident, limit=6):
         with self.lock:
@@ -435,6 +439,7 @@ def film_schema(store):
             availability TEXT NOT NULL DEFAULT 'unknown', available_at TEXT,
             evidence TEXT, query_override TEXT, updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS title_origin (title_id TEXT PRIMARY KEY,fingerprint TEXT,status TEXT NOT NULL DEFAULT 'unknown',countries_json TEXT,entity_id TEXT,kind TEXT,family TEXT,year TEXT,checked_at TEXT,next_check TEXT,error INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS title_control (title_id TEXT PRIMARY KEY, paused INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, name_key TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS promotions (
             title_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1,
@@ -502,6 +507,29 @@ def resume_tracking(store,ident):
         store.db.execute('UPDATE title_control SET paused=0,deleted=0,updated_at=? WHERE title_id=?',(now(),ident))
 
 
+def add_manual_title(store,title,kind='films',year=''):
+    if kind not in ('films','serials','cartoons') or (year and (not year.isdigit() or not 1880<=int(year)<=datetime.now(UTC).year+10)):
+        raise ValueError('Проверьте тип и год тайтла.')
+    with store.lock:same=[dict(r) for r in store.db.execute('SELECT * FROM titles') if name_key(r['title'])==name_key(title)]
+    exact=[r for r in same if r['type']==kind and detail_for(store,r).get('year')==year] if year else []
+    if len(exact)==1:return store.add_watch(ident=exact[0]['id'])
+    conflict=bool(same and (len(same)>1 or any(r['type']!=kind or (year and detail_for(store,r).get('year') and detail_for(store,r).get('year')!=year) or (year and r['status']!='watched' and not detail_for(store,r).get('year')) for r in same)))
+    if conflict and not year:raise ValueError('Есть одноимённые тайтлы. Укажите год.')
+    chosen=title+' ('+year+', '+kind_suffix(kind)+')' if conflict else title
+    ident,added=store.add_watch(chosen)
+    with store.lock,store.db:
+        store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(kind,ident))
+        if year:
+            query=title+' '+kind_suffix(kind)+' '+year
+            previous=store.db.execute('SELECT wordstat_query FROM titles WHERE id=?',(ident,)).fetchone()[0]
+            store.db.execute('INSERT INTO film_details(title_id,year,query_override,updated_at) VALUES(?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET year=excluded.year,query_override=CASE WHEN COALESCE(film_details.query_override,"")="" THEN excluded.query_override ELSE film_details.query_override END',(ident,year,query,now()))
+            current=store.db.execute('SELECT query_override FROM film_details WHERE title_id=?',(ident,)).fetchone()[0]
+            if previous and previous!=current:
+                store.db.execute('UPDATE titles SET measured_at=NULL,total_count=NULL,dynamics_json=NULL,trend=NULL,delta=NULL WHERE id=?',(ident,))
+                store.set_meta('dynamics_checked:'+ident,'');store.set_meta('growth_alert:'+ident,'quiet');store.set_meta('demand_alert:'+ident,'quiet')
+    return ident,added
+
+
 def pause_tracking(store,ident,deleted=False):
     with store.lock,store.db:
         row=store.db.execute('SELECT title FROM titles WHERE id=?',(ident,)).fetchone()
@@ -538,7 +566,7 @@ def promotion_rows(store):
 
 def all_tracking(store):
     # A departure from the coming-soon list is not a departure from the cinema.
-    return store.rows('title ASC','(status!="watched" OR id IN (SELECT title_id FROM watchlist) OR id IN (SELECT title_id FROM promotions WHERE active=1)) AND id NOT IN (SELECT title_id FROM title_control WHERE paused=1)',10000)
+    return [r for r in store.rows('title ASC','(status!="watched" OR id IN (SELECT title_id FROM watchlist) OR id IN (SELECT title_id FROM promotions WHERE active=1)) AND id NOT IN (SELECT title_id FROM title_control WHERE paused=1)',10000) if foreign_title(store,r)]
 
 
 def demand_comparison(row):
@@ -576,7 +604,10 @@ def growth_rows(store, early=False):
         if not early:
             # Demand threshold alone controls membership. Missing/stale dynamics
             # and query uncertainty are shown on the card, not hidden by the list.
-            if n>50000:rows.append(row)
+            radar_ids=radar_tracked_ids(store)
+            c=demand_comparison(row)
+            radar_growth=row['id'] in radar_ids and fresh_demand(store,row) and c and signal_fresh(store,row,c) and row['trend']=='растёт' and not store.meta('dynamics_error:'+row['id'],'')
+            if n>50000 or radar_growth:rows.append(row)
             continue
         if not fresh_demand(store,row):continue
         c=demand_comparison(row)
@@ -602,6 +633,7 @@ def confirmed_decline(store,row):
 
 
 def evaluate_decline(store, row):
+    if not foreign_title(store,row):return None
     c=demand_comparison(row)
     if row['ambiguous'] or not signal_fresh(store,row,c) or not c or c['percent'] is None: return None
     if store.meta('dynamics_error:'+row['id'],''): return None
@@ -624,12 +656,216 @@ def evaluate_decline(store, row):
 def pending_declines(store):
     result=[]
     for row in promotion_rows(store):
+        if not foreign_title(store,row):continue
         c=demand_comparison(row)
         with store.lock: state=store.db.execute('SELECT * FROM decline_state WHERE title_id=?',(row['id'],)).fetchone()
         if state and state['confirmations']>=2 and not state['notified'] and c and signal_fresh(store,row,c) and c['percent'] is not None and c['percent']<=-30 and not row['ambiguous'] and not store.meta('dynamics_error:'+row['id'],''):
             result.append({**row,'comparison':c})
     return result
 
+
+
+# Official Wikidata metadata. No page scraping, credentials or paid API.
+WIKIDATA_API = 'https://www.wikidata.org/w/api.php'
+RUSSIAN_ORIGINS = {'Q159','Q15180','Q34266'}
+
+
+def origin_fingerprint(store,row):
+    year=detail_for(store,row).get('year','') if not row['id'].startswith('radar:') else row.get('year','')
+    return hashlib.sha256((name_key(row['title'])+'|'+str(year or '')+'|'+str(row.get('type') or '')).encode()).hexdigest()
+
+
+def origin_info(store,row):
+    if isinstance(row,str):
+        with store.lock:r=store.db.execute('SELECT * FROM titles WHERE id=?',(row,)).fetchone()
+        if not r:return {'status':'unknown'}
+        row=dict(r)
+    with store.lock:r=store.db.execute('SELECT * FROM title_origin WHERE title_id=?',(row['id'],)).fetchone()
+    return dict(r) if r and r['fingerprint']==origin_fingerprint(store,row) else {'status':'unknown'}
+
+
+def foreign_title(store,row):
+    return origin_info(store,row)['status']=='foreign'
+
+
+def save_origin(store,row,data):
+    stamp=now();status=data.get('status','unknown')
+    if status not in ('foreign','russian','unknown'):status='unknown'
+    with store.lock,store.db:
+        # Year and kind come from the uniquely matched entity, never from its popularity.
+        if status in ('foreign','russian') and not row['id'].startswith('radar:'):
+            year=data.get('year','');kind=data.get('kind','')
+            if year:
+                store.db.execute('INSERT INTO film_details(title_id,year,updated_at) VALUES(?,?,?) ON CONFLICT(title_id) DO UPDATE SET year=CASE WHEN COALESCE(film_details.year,"")="" THEN excluded.year ELSE film_details.year END',(row['id'],year,stamp))
+            if kind in ('films','serials','cartoons'):
+                # Preserve source kind; display_kind comes from this metadata record.
+                pass
+        retry=(datetime.now(UTC)+timedelta(days=30 if status!='unknown' else 1)).isoformat()
+        if data.get('error'):retry=(datetime.now(UTC)+timedelta(hours=1)).isoformat()
+        store.db.execute('INSERT INTO title_origin(title_id,fingerprint,status,countries_json,entity_id,kind,family,year,checked_at,next_check,error) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET fingerprint=excluded.fingerprint,status=excluded.status,countries_json=excluded.countries_json,entity_id=excluded.entity_id,kind=excluded.kind,family=excluded.family,year=excluded.year,checked_at=excluded.checked_at,next_check=excluded.next_check,error=excluded.error',
+            (row['id'],origin_fingerprint(store,row),status,json.dumps(data.get('countries',[]),ensure_ascii=False),data.get('entity_id',''),data.get('kind',''),data.get('family') or (data.get('kind') if data.get('kind') in ('films','serials') else ''),data.get('year',''),stamp,retry,bool(data.get('error'))))
+
+
+class OriginUnavailable(Exception):
+    pass
+
+
+def _wikidata_request(params):
+    from urllib.parse import urlencode
+    import gzip,io
+    url=WIKIDATA_API+'?'+urlencode({'format':'json','maxlag':'5',**params})
+    request=Request(url,headers={'User-Agent':'TVOE-Demand-Monitor/2.2 (https://github.com/senyaav27/Wortstat-senyaa-)','Accept':'application/json','Accept-Encoding':'gzip'})
+    try:
+        with urlopen(request,timeout=12) as response:
+            raw=response.read(2_000_001)
+            if len(raw)>2_000_000:raise OriginUnavailable()
+            if response.headers.get('Content-Encoding')=='gzip':raw=gzip.GzipFile(fileobj=io.BytesIO(raw)).read(2_000_001)
+        if len(raw)>2_000_000:raise OriginUnavailable()
+        data=json.loads(raw)
+        if not isinstance(data,dict) or data.get('error'):raise OriginUnavailable()
+        return data
+    except (HTTPError,URLError,OSError,TimeoutError,ValueError,UnicodeError) as exc:
+        raise OriginUnavailable() from None
+
+
+WIKIDATA_IO_LOCK=threading.Lock()
+WIKIDATA_LAST_CALL=0.0
+
+
+def wikidata_request(params):
+    # One request at a time, an overall deadline also covers blocked DNS.
+    from queue import Queue,Empty
+    if not WIKIDATA_IO_LOCK.acquire(blocking=False):raise OriginUnavailable()
+    result=Queue(maxsize=1)
+    def run():
+        global WIKIDATA_LAST_CALL
+        try:
+            delay=max(0.0,1.0-(time.monotonic()-WIKIDATA_LAST_CALL))
+            if delay:time.sleep(delay)
+            WIKIDATA_LAST_CALL=time.monotonic()
+            result.put(_wikidata_request(params))
+        except Exception:result.put(None)
+        finally:WIKIDATA_IO_LOCK.release()
+    worker=threading.Thread(target=run,daemon=True);worker.start()
+    try:data=result.get(timeout=15)
+    except Empty:raise OriginUnavailable() from None
+    if data is None:raise OriginUnavailable()
+    return data
+
+
+def claim_values(entity,prop):
+    return [r.get('mainsnak',{}).get('datavalue',{}).get('value') for r in entity.get('claims',{}).get(prop,[]) if r.get('rank')!='deprecated']
+
+
+def claim_ids(entity,prop):
+    return {v['id'] for v in claim_values(entity,prop) if isinstance(v,dict) and re.fullmatch(r'Q\d+',v.get('id',''))}
+
+
+class WikidataOrigin:
+    def __init__(self,transport=wikidata_request):
+        self.transport=transport;self.classes={};self.countries={}
+
+    def entities(self,ids):
+        if not ids:return {}
+        return self.transport({'action':'wbgetentities','ids':'|'.join(sorted(ids)[:50]),'props':'labels|aliases|claims','languages':'ru|en'}).get('entities',{})
+
+    def kind(self,entity):
+        found=claim_ids(entity,'P31');front=set(found)
+        for _ in range(2):
+            if found & {'Q11424','Q5398426','Q202866','Q581714'}:break
+            missing=front-self.classes.keys()
+            if missing:self.classes.update(self.entities(missing))
+            front={p for q in front for p in claim_ids(self.classes.get(q,{}),'P279')}-found
+            found.update(front)
+            if not front:break
+        family='serials' if found & {'Q5398426','Q581714'} else 'films' if found & {'Q11424','Q202866'} else ''
+        if found & {'Q202866','Q581714'}:return 'cartoons',family
+        return family,family
+
+    def resolve(self,title,year='',kind=''):
+        title=re.sub(r'\s*\(\d{4},\s*(?:фильм|сериал|мультфильм)\)\s*$','',title).strip()
+        search=self.transport({'action':'wbsearchentities','search':title,'language':'ru','uselang':'ru','limit':'50','type':'item'})
+        if search.get('search-continue') is not None:return {'status':'unknown'}
+        ids={x['id'] for x in search.get('search',[]) if re.fullmatch(r'Q\d+',x.get('id',''))}
+        entities=self.entities(ids);matches=[]
+        for q,e in entities.items():
+            aliases=[v.get('value','') for v in e.get('labels',{}).values()]
+            aliases += [v.get('value','') for values in e.get('aliases',{}).values() for v in values]
+            if name_key(title) not in {name_key(a) for a in aliases}:continue
+            years={v['time'][1:5] for v in claim_values(e,'P577') if isinstance(v,dict) and re.match(r'\+\d{4}-',v.get('time','')) and v.get('precision',0)>=9}
+            if year and year not in years:continue
+            entity_kind,family=self.kind(e)
+            if not entity_kind or (kind in ('films','serials') and family!=kind) or (kind=='cartoons' and entity_kind!='cartoons'):continue
+            matches.append((q,e,entity_kind,family,min(years) if years else ''))
+        # Never pick the first search result when remakes or namesakes exist.
+        if len(matches)!=1:return {'status':'unknown'}
+        q,e,entity_kind,family,entity_year=matches[0];country_ids=claim_ids(e,'P495')
+        if not country_ids:return {'status':'unknown'}
+        result={'entity_id':q,'kind':entity_kind,'family':family,'year':year or entity_year,'countries':[]}
+        if country_ids & RUSSIAN_ORIGINS:return {**result,'status':'russian','countries':sorted(country_ids)}
+        missing=country_ids-self.countries.keys()
+        if missing:self.countries.update(self.entities(missing))
+        for country in sorted(country_ids):
+            country_entity=self.countries.get(country,{})
+            codes={str(v).upper() for v in claim_values(country_entity,'P297')}
+            if codes & {'RU','SU'}:return {**result,'status':'russian'}
+            if not codes or not all(re.fullmatch(r'[A-Z]{2}',v) for v in codes):return {'status':'unknown'}
+            label=country_entity.get('labels',{}).get('ru',{}).get('value','')
+            if not label:return {'status':'unknown'}
+            result['countries'].append(label)
+        return {**result,'status':'foreign'}
+
+
+def raw_radar_rows(store):
+    cutoff=(datetime.now(UTC)-timedelta(days=7)).isoformat()
+    with store.lock:
+        return [dict(r) for r in store.db.execute('SELECT r.*,s.name source_name FROM radar_items r JOIN radar_sources s ON s.id=r.source_id WHERE r.dismissed=0 AND COALESCE(NULLIF(r.published_at,""),r.found_at)>=? ORDER BY r.found_at DESC LIMIT 500',(cutoff,))]
+
+
+def radar_identity(store,row):
+    ident=row.get('confirmed_id') or row.get('match_id')
+    if ident:
+        with store.lock:title=store.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()
+        if title:return dict(title)
+    return {'id':'radar:'+row['id'],'title':row['title'],'type':store.meta('radar_kind:'+row['id'],''),'year':''}
+
+
+def refresh_origins(store,resolver=None,budget=10,target_id=None):
+    if store.meta('origin_retry_at','')>now():return 0
+    if not store.origin_lock.acquire(blocking=False):return 0
+    try:
+        resolver=resolver or WikidataOrigin()
+        rows=store.rows('first_seen DESC','1=1',10000)
+        rows += [radar_identity(store,r) for r in raw_radar_rows(store)]
+        if target_id:rows.sort(key=lambda r:r['id']!=target_id)
+        done=0;seen=set();cached={}
+        for row in rows:
+            if row['id'] in seen:continue
+            seen.add(row['id']);info=origin_info(store,row)
+            if info.get('next_check','')>now():continue
+            if done>=budget:break
+            fingerprint=origin_fingerprint(store,row)
+            year=row.get('year','') if row['id'].startswith('radar:') else detail_for(store,row).get('year','')
+            try:
+                data=cached.get(fingerprint)
+                if data is None:
+                    data=resolver.resolve(row['title'],year or '',row.get('type') or '')
+                    cached[fingerprint]=data;done+=1
+                with store.lock:
+                    latest=row if row['id'].startswith('radar:') else store.db.execute('SELECT * FROM titles WHERE id=?',(row['id'],)).fetchone()
+                    if not latest or origin_fingerprint(store,dict(latest))!=fingerprint:continue
+                    save_origin(store,dict(latest),data)
+            except OriginUnavailable:
+                if info['status'] in ('foreign','russian'):
+                    with store.lock,store.db:store.db.execute('UPDATE title_origin SET next_check=?,error=1 WHERE title_id=?',((datetime.now(UTC)+timedelta(hours=1)).isoformat(),row['id']))
+                else:save_origin(store,row,{'status':'unknown','error':True})
+                store.set_meta('origin_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
+                store.set_meta('origin_error','Источник стран временно недоступен. Неопределённые тайтлы скрыты.')
+                break  # Back off globally, no loop over titles after 429/maxlag/error.
+        else:store.set_meta('origin_error','')
+        auto_track_radar(store)
+        return done
+    finally:store.origin_lock.release()
 
 def bounded_text(url, headers=None, max_bytes=2_000_000):
     req=Request(url,headers={'User-Agent':'TVOE-Demand-Monitor/2.0','Accept':'application/rss+xml, application/xml, text/html;q=0.8',**(headers or {})})
@@ -699,7 +935,7 @@ def reason_for(text, google=False):
 def radar_candidates(store, item, google=False):
     text=item['text'];key=' '+name_key(text)+' '
     matches=[]
-    for row in all_tracking(store):
+    for row in store.rows('title ASC','1=1',10000):
         k=name_key(row['title'])
         if len(k)>=5 and (' '+k+' ') in key: matches.append(row)
     candidates={name_key(r['title']):(r['title'],r['id'] if sum(name_key(x['title'])==name_key(r['title']) for x in matches)==1 else None) for r in matches}
@@ -743,9 +979,7 @@ def import_radar(store, source, items):
 
 
 def radar_rows(store):
-    cutoff=(datetime.now(UTC)-timedelta(days=7)).isoformat()
-    with store.lock:
-        return [dict(r) for r in store.db.execute('SELECT r.*,s.name source_name FROM radar_items r JOIN radar_sources s ON s.id=r.source_id WHERE r.dismissed=0 AND COALESCE(NULLIF(r.published_at,""),r.found_at)>=? ORDER BY r.found_at DESC LIMIT 100',(cutoff,))]
+    return [r for r in raw_radar_rows(store) if foreign_title(store,radar_identity(store,r))]
 
 
 def auto_track_radar(store):
@@ -768,14 +1002,17 @@ def auto_track_radar(store):
             if store.meta('auto_radar_seen:'+ident,''):continue
             ident,new=store.add_watch(ident=ident)
         else:
-            if len(independent)<2 or len(kinds)!=1:continue
+            verified=origin_info(store,radar_identity(store,rows[0]))
+            if verified['status']!='foreign':continue
             # Do not choose among remakes or overwrite a manually identified title.
             matches=[r for r in store.rows('title ASC','1=1',10000) if name_key(r['title'])==name_key(rows[0]['title'])]
             if matches:continue
             ident,new=store.add_watch(rows[0]['title'])
-            kind=next(iter(kinds))
+            kind=verified.get('family') or verified.get('kind') or (next(iter(kinds)) if len(kinds)==1 else 'films')
             with store.lock,store.db:
                 store.db.execute('UPDATE titles SET type=? WHERE id=? AND status="watched"',(kind,ident))
+        if not known:
+            save_origin(store,dict(store.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()),{**verified,'countries':json.loads(verified.get('countries_json') or '[]')})
         with store.lock,store.db:
             store.set_meta('auto_radar_seen:'+ident,now())
             store.set_meta('auto_radar:'+ident,'Найден автоматически по источникам. Доступность TVOЁ не подтверждена.')
@@ -882,7 +1119,7 @@ def confirm_radar(store, ident, title='', year='', kind='films'):
     with store.lock,store.db:
         row=store.db.execute('SELECT * FROM radar_items WHERE id=? AND dismissed=0',(ident,)).fetchone()
         if not row:raise ValueError('Публикация не найдена.')
-        if kind not in ('films','serials'):raise ValueError('Выберите фильм или сериал.')
+        if kind not in ('films','serials','cartoons'):raise ValueError('Выберите фильм или сериал.')
         if year and (not year.isdigit() or not 1880<=int(year)<=datetime.now(UTC).year+10):raise ValueError('Проверьте год.')
         if row['confirmed_id']:return row['confirmed_id'],False
         chosen=title.strip() or row['title']
@@ -958,7 +1195,7 @@ class Analyzer:
                 try:
                     override = detail_for(self.store,row).get('query_override')
                     initial = self.wordstat.top(override or row['title'])
-                    query, note, ambiguous = ((override, 'Запрос подтверждён пользователем.', False) if override else choose_query(row, initial))
+                    query, note, ambiguous = ((override, 'Запрос подтверждён пользователем.', False) if override else choose_query({**row,'type':origin_info(self.store,row).get('family') or row['type']}, initial))
                     if not tracking_enabled(self.store,row['id']):continue
                     top = self.wordstat.top(query) if query != (override or row['title']) else initial
                     count = int(top['totalCount'])
@@ -1104,9 +1341,9 @@ def render_list(store, kind, page):
     elif kind=='new':
         rows=store.new_rows()[page*5:(page+1)*5]
     elif kind == 'soon':
-        rows = sorted(store.rows('title ASC', where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
+        rows = sorted([r for r in store.rows('title ASC', where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000) if foreign_title(store,r)], key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
     else:
-        rows = store.rows(order, where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 5, page*5)
+        rows = [r for r in store.rows(order, where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)',10000) if foreign_title(store,r)][page*5:(page+1)*5]
     labels = {'top':'🔥 Популярное','growth':'🔎 Сигналы: спрос выше 50 000','soon':'📅 Скоро в подписке','new':'🆕 Новые тайтлы'}
     text = labels[kind] + f' - страница {page+1}\n\n' + ('\n\n'.join(item_text(row, page*5+i+1) for i,row in enumerate(rows)) if rows else 'Пока нет данных.')
     buttons = []
@@ -1208,6 +1445,8 @@ def title_analysis(store, row, csrf_field):
 
 DASHBOARD_CSS = '''
 :root{--bg:#f7f8f6;--white:#fff;--ink:#172421;--muted:#69746e;--line:#dfe5df;--green:#125b43;--soft:#e9f5ed;--warn:#fff2df;--red:#9a403d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green)}button,input,select{font:inherit}button,.button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 16px;border-radius:10px;border:1px solid var(--green);background:var(--green);color:white;font-weight:650;text-decoration:none;text-align:center}button.secondary,.button.secondary{background:white;color:var(--ink);border-color:var(--line)}button:hover,.button:hover{filter:brightness(.94)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79b49a;outline-offset:3px}input,select{border:1px solid #cbd5cc;border-radius:9px;background:#fff;color:var(--ink);padding:10px 12px;min-height:44px;min-width:0;max-width:100%}form{margin:0}.head{max-width:1200px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:28px 24px 18px}.brand{font-size:30px;letter-spacing:-1px;font-weight:800;text-decoration:none;color:var(--ink)}.brand small{font-size:16px;font-weight:500;letter-spacing:0;color:var(--muted);display:block}.stamp{font-size:12px;color:var(--muted);text-align:right}.stamp strong{display:block;color:var(--ink);font-size:13px}main{max-width:1200px;margin:auto;padding:0 24px 56px}.hero{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:12px 0 22px}.hero h1{font-size:30px;letter-spacing:-.8px;line-height:1.18;margin:0 0 5px}.hero p,.section-head p{margin:0;color:var(--muted)}.hero-facts{display:flex;gap:10px;align-items:center}.hero-facts>span{font-size:12px;color:var(--muted);max-width:160px}nav{display:flex;gap:6px;background:white;border:1px solid var(--line);border-radius:13px;padding:7px;margin-bottom:24px}.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 8px;border-radius:9px;text-decoration:none;color:var(--ink);white-space:nowrap;font-weight:600}.tab.active{background:var(--green);color:#fff}.tab small{font-size:11px;opacity:.7}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:18px}.section-head h2{font-size:23px;margin:0;letter-spacing:-.5px}.section-head p{max-width:540px;font-size:13px}.controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}.controls form{display:flex;gap:8px}.controls input[type=search]{width:230px}.modes{display:flex;flex-wrap:wrap;gap:7px}.mode{display:block;padding:8px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px}.mode.active{background:var(--green);color:white;border-color:var(--green)}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.entry{border:1px solid var(--line);border-radius:15px;background:#fff;padding:20px;min-width:0}.card-top{display:grid;grid-template-columns:80px minmax(0,1fr);gap:16px}.poster{width:80px;height:112px;border-radius:9px;object-fit:cover;background:#ecf0eb}.poster-placeholder{display:flex;align-items:center;justify-content:center;color:var(--green);font-size:32px;font-weight:700}.title{font-size:19px;line-height:1.3;margin:0 0 7px;overflow-wrap:anywhere}.title a{text-decoration:none;color:var(--ink)}.detail{font-size:12px;color:var(--muted);margin-bottom:9px;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:4px 8px;font-size:12px;font-weight:600;margin:2px 4px 6px 0;background:#edf0ed;color:var(--muted)}.badge.available{background:#dff3e5;color:var(--green)}.badge.soon,.badge.warn{background:var(--warn);color:#87551d}.decline-card{border:2px solid var(--red);background:#fff5f4}.badge.fall{background:#fbe9e7;color:var(--red)}.demand{font-weight:750;font-size:21px;line-height:1.4}.demand small{font-size:12px;font-weight:400;color:var(--muted)}.trend{color:var(--green);font-size:15px;font-weight:700}.fall-text{color:var(--red)}.spark{display:block;width:100%;height:68px;margin:12px 0 4px;color:var(--green)}.spark.falling{color:var(--red)}.data-date{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions form{display:inline-flex}.actions button,.actions .button{font-size:12px;padding:9px 12px}.analysis{margin-top:13px;border-top:1px solid var(--line);padding-top:10px;font-size:12px;overflow-wrap:anywhere}.analysis summary{cursor:pointer;color:var(--muted);min-height:34px;padding:5px 0}.analysis p{color:var(--muted)}.analysis .data-error{color:var(--red)}.demand-chart{width:100%;height:120px;color:var(--green)}.edit-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.edit-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.edit-form .wide{grid-column:1/-1}.edit-form input,.edit-form select{width:100%}.edit-form button{justify-self:start}.watch-add{width:100%;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff;display:flex;gap:8px;flex-wrap:wrap}.watch-add label{width:100%;font-size:13px;font-weight:600}.watch-add input{flex:1;width:auto;min-width:120px}.empty{padding:32px;border:1px dashed var(--line);border-radius:12px;grid-column:1/-1;color:var(--muted);background:#fff}.empty strong{display:block;margin-bottom:6px;color:var(--ink)}.notice{font-size:12px;line-height:1.6;color:var(--muted);margin:18px 0}.status-notice{background:#fff8e9;border:1px solid #e6d8ba;border-radius:10px;padding:12px 16px}.source-list{margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;font-size:12px}.source-list summary{font-weight:600;cursor:pointer;min-height:30px}.source-row{display:flex;justify-content:space-between;align-items:start;gap:16px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px}.source-row span{color:var(--muted);text-align:right}.radar-card .title{font-size:18px}.radar-card .reason{color:var(--green);margin:8px 0}.lock{max-width:520px;margin:12vh auto;padding:28px}.lock h1{font-size:26px}.health-line{font-size:12px;color:var(--muted);margin-top:24px}.danger{color:var(--red)!important}.pagination{display:flex;gap:9px;justify-content:center;margin-top:20px}@media(max-width:760px){.head{padding:20px 16px 12px;align-items:start}.brand{font-size:25px}.brand small{font-size:12px}.stamp{font-size:10px;max-width:125px}.stamp strong{font-size:11px}main{padding:0 16px 40px}.hero{display:block;margin-top:14px}.hero h1{font-size:26px}.hero p{font-size:13px}.hero-facts{margin-top:14px}.hero-facts>span{max-width:none}nav{flex-wrap:wrap;gap:4px;padding:5px}.tab{flex:1 0 28%;padding:10px 5px;font-size:12px}.section-head{display:block}.section-head p{margin-top:6px}.controls{display:block}.controls>form{margin-top:12px;width:100%}.controls input[type=search]{width:auto;flex:1}.modes{margin-bottom:12px}.list{grid-template-columns:1fr}.entry{padding:16px}.card-top{grid-template-columns:68px minmax(0,1fr);gap:12px}.poster{width:68px;height:96px}.title{font-size:17px}.demand{font-size:19px}.actions{gap:7px}.source-row{display:block}.source-row span{display:block;text-align:left;margin-top:3px}.watch-add input{flex-basis:55%}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+:root{--scroll-thumb:#a5b6ac;--scroll-track:#eef2ee;--scroll-hover:#788f80}html{scrollbar-gutter:stable;scrollbar-color:var(--scroll-thumb) var(--scroll-track);scrollbar-width:auto}*{scrollbar-color:var(--scroll-thumb) var(--scroll-track)}*::-webkit-scrollbar{width:12px;height:12px}*::-webkit-scrollbar-track{background:var(--scroll-track)}*::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border:3px solid var(--scroll-track);border-radius:8px}*::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover)}.list{overflow-anchor:none}.watch-add #add-title{flex:1 0 100%;width:100%}.watch-add label:not([for]){display:grid;gap:5px;flex:1;min-width:120px;width:auto;font-size:12px;font-weight:400;color:var(--muted)}.watch-add label input,.watch-add label select{width:100%}.dataset-controls{width:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:end}.controls .dataset-controls input[type=search]{width:100%;min-width:0}.dataset-controls label{display:grid;gap:5px;font-size:12px;color:var(--muted);min-width:135px;flex:1}.dataset-controls select,.dataset-controls input{width:100%}.dataset-query{flex:2!important}.action-status{position:fixed;bottom:calc(16px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 32px);padding:12px 16px;border:1px solid var(--green);border-radius:10px;background:var(--soft);color:var(--green);z-index:20}.action-status.error{background:#fff0ed;color:var(--red);border-color:var(--red)}.action-status[hidden]{display:none}.form-error{color:var(--red);font-size:12px;flex-basis:100%;margin:8px 0}button:disabled{opacity:.55;cursor:wait}button[aria-busy=true]{box-shadow:inset 0 0 0 2px #ffffff66}dialog{border:1px solid var(--line);border-radius:15px;max-width:480px;width:calc(100vw - 32px);max-height:calc(100dvh - 40px);overflow:auto;padding:24px;color:var(--ink);background:var(--white)}dialog::backdrop{background:#17242166}dialog h2{font-size:22px;margin-top:0}dialog .danger{background:var(--red);border-color:var(--red);color:white!important}.load-more{margin-top:20px}@media(max-width:760px){.dataset-controls{display:grid!important;grid-template-columns:1fr 1fr}.controls .dataset-controls input[type=search]{width:100%;min-width:0}.dataset-controls label{min-width:0}.dataset-controls .dataset-query{grid-column:1/-1}.dataset-controls button,.dataset-controls a{width:100%}}@media(forced-colors:active){*{scrollbar-color:auto}.action-status,dialog{border:1px solid CanvasText}}
+
 '''
 
 
@@ -1242,7 +1481,7 @@ def availability_badge(store,row):
 
 def action_form(path, csrf, fields, label, secondary=False):
     hidden=''.join(f'<input type="hidden" name="{html.escape(k,quote=True)}" value="{html.escape(str(v),quote=True)}">' for k,v in fields.items())
-    return f'<form action="{path}" method="post">{csrf}{hidden}<button class="{"secondary" if secondary else ""}" type="submit">{label}</button></form>'
+    return f'<form novalidate action="{path}" method="post">{csrf}{hidden}<button class="{"secondary" if secondary else ""}" type="submit">{label}</button></form>'
 
 
 def film_card(store,row,view,csrf,watched,promoted):
@@ -1254,8 +1493,11 @@ def film_card(store,row,view,csrf,watched,promoted):
     picture=(f'<img class="poster" src="{esc(poster,quote=True)}" alt="Постер: {esc(row["title"],quote=True)}" loading="lazy" referrerpolicy="no-referrer">' if poster else f'<div class="poster poster-placeholder" aria-hidden="true">{esc(row["title"][:1].upper())}</div>')
     count=f'{row["total_count"]:,}'.replace(',',' ') if row['total_count'] is not None else 'Ожидает проверки'
     pct=(f'{c["percent"]:+.1f}%' if c and c['percent'] is not None else '')
-    kind='Сериал' if row['type']=='serials' else 'Фильм'
+    kind='Мультфильм' if origin_info(store,row).get('kind')=='cartoons' else 'Сериал' if row['type']=='serials' else 'Фильм'
     subtitle=kind+(' · '+d['year'] if d.get('year') else '')
+    info=origin_info(store,row)
+    subtitle+=' · '+', '.join(json.loads(info.get('countries_json') or '[]'))
+    subtitle+=' · Добавлен '+stamp_ru(added_stamp(store,row,view))
     badges=availability_badge(store,row)
     if not tracking_enabled(store,row['id']):badges+='<span class="badge warn">Слежение остановлено</span>'
     if row['ambiguous']:badges+='<span class="badge warn">Уточните запрос</span>'
@@ -1275,14 +1517,14 @@ def film_card(store,row,view,csrf,watched,promoted):
     declining=view=='ads' and confirmed_decline(store,row)
     if declining:
         controls+='<span class="badge fall">Подтверждённый спад · рассмотреть снятие с рекламы</span>'
-    edit=(f'<details class="analysis"><summary>Уточнить фильм и доступность</summary><form class="edit-form" action="/film" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}"><input type="hidden" name="return" value="{view}">'
-          f'<label>Тип<select name="type" aria-label="Тип"><option value="films" {"selected" if kind=="Фильм" else ""}>Фильм</option><option value="serials" {"selected" if kind=="Сериал" else ""}>Сериал</option></select></label>'
+    edit=(f'<details class="analysis"><summary>Уточнить фильм и доступность</summary><form novalidate class="edit-form" action="/film" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}"><input type="hidden" name="return" value="{view}">'
+          f'<label>Тип<select name="type" aria-label="Тип"><option value="films" {"selected" if kind=="Фильм" else ""}>Фильм</option><option value="serials" {"selected" if kind=="Сериал" else ""}>Сериал</option><option value="cartoons" {"selected" if kind=="Мультфильм" else ""}>Мультфильм</option></select></label>'
           f'<label>Год<input name="year" inputmode="numeric" maxlength="4" value="{esc(d.get("year") or "",quote=True)}" placeholder="Например, 2026"></label>'
           '<label class="wide">Доступность в TVOЁ<select name="availability" aria-label="Доступность в TVOЁ">'+''.join(f'<option value="{key}" {"selected" if d["availability"]==key else ""}>{label}</option>' for key,label in [('unknown','Не подтверждена'),('available','Доступен в подписке'),('soon','Скоро'),('unavailable','Недоступен')])+'</select></label>'
           f'<label class="wide">Подтверждённый запрос Wordstat<input name="query" maxlength="180" value="{esc(d.get("query_override") or "",quote=True)}" placeholder="Название + фильм / сериал / год"></label>'
           '<p class="notice wide">Подтверждайте доступность после проверки карточки TVOЁ. Уточнение запроса сохраняет старую историю отдельно.</p><button type="submit">Сохранить</button></form></details>')
     date_info=(f'Последние данные · {short_date(c["to"])} · два полных периода по 7 дней' if c else 'Динамика ещё не получена')
-    return (f'<article class="entry {"decline-card" if declining else ""}"><div class="card-top">{picture}<div><h3 class="title">{heading}</h3><div class="detail">{esc(subtitle)}</div>{badges}<div class="demand">{count}<small>{" запросов / 30 дней" if row["total_count"] is not None else ""}</small>{change}</div><div class="detail">Wordstat проверен · {esc(short_date(row["measured_at"]))}</div></div></div>'
+    return (f'<article data-entry-id="{esc(row['id'],quote=True)}" data-title="{esc(row['title'],quote=True)}" class="entry {"decline-card" if declining else ""}"><div class="card-top">{picture}<div><h3 class="title">{heading}</h3><div class="detail">{esc(subtitle)}</div>{badges}<div class="demand">{count}<small>{" запросов / 30 дней" if row["total_count"] is not None else ""}</small>{change}</div><div class="detail">Wordstat проверен · {esc(short_date(row["measured_at"]))}</div></div></div>'
             +sparkline(row)+f'<div class="data-date">{esc(date_info)}</div><div class="actions">{controls}</div>'+title_analysis(store,row,csrf)+edit+'</article>')
 
 
@@ -1313,56 +1555,270 @@ def radar_card(store,row,csrf):
         if tracked:
             r=tracked[0];n=r['total_count']
             demand='<p class="demand">'+(f'{n:,}'.replace(',',' ')+' <small>запросов / 30 дней</small>' if n is not None else 'Ожидает Wordstat')+'</p>'
-    form='' if confirmed else (f'<details class="analysis"><summary>Подтвердить фильм</summary><form class="edit-form" action="/radar-confirm" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}">'
-          f'<label class="wide">Название<input name="title" maxlength="160" required value="{esc(row["title"],quote=True)}"></label><label>Год<input name="year" maxlength="4" inputmode="numeric"></label><label>Тип<select name="type" aria-label="Тип"><option value="films">Фильм</option><option value="serials">Сериал</option></select></label><button class="wide" type="submit">Подтвердить и следить</button></form></details>')
-    return (f'<article class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+promote+'</div>'+demand+form+'</article>')
+    if film_id and confirmed:
+        countries=json.loads(origin_info(store,film_id).get('countries_json') or '[]')
+        state+=' · '+', '.join(countries)
+    form='' if confirmed else (f'<details class="analysis"><summary>Подтвердить фильм</summary><form novalidate class="edit-form" action="/radar-confirm" method="post">{csrf}<input type="hidden" name="id" value="{esc(row["id"],quote=True)}">'
+          f'<label class="wide">Название<input name="title" maxlength="160" required value="{esc(row["title"],quote=True)}"></label><label>Год<input name="year" maxlength="4" inputmode="numeric"></label><label>Тип<select name="type" aria-label="Тип"><option value="films">Фильм</option><option value="serials">Сериал</option><option value="cartoons">Мультфильм</option></select></label><button class="wide" type="submit">Подтвердить и следить</button></form></details>')
+    return (f'<article data-entry-id="radar:{esc(row['id'],quote=True)}" data-title="{esc(row['title'],quote=True)}" class="entry radar-card"><div class="detail">{esc(row["source_name"])} · {esc(short_date(row["published_at"] or row["found_at"]))}</div><h3 class="title">{esc(row["title"])}</h3><p class="reason">{esc(row["reason"] or "Упоминание")}</p><span class="badge {"available" if confirmed else "warn"}">{state}</span><div class="actions"><a class="button secondary" href="{esc(row["url"],quote=True)}" target="_blank" rel="noopener noreferrer">Открыть источник</a>'+action_form('/radar-dismiss',csrf,{'id':row['id']},'Скрыть',True)+promote+'</div>'+demand+form+'</article>')
 
 
-def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
+
+
+DASHBOARD_SCRIPT = r'''
+(() => {
+  if (window.tvoeDashboardReady) return;
+  window.tvoeDashboardReady = true;
+  let listRequest = 0, listController, mutationBusy = false, clearTimer, sessionExpired=false;
+  const toast = (message, error=false) => {
+    const region=document.getElementById('action-status');
+    region.textContent=message;
+    region.classList.toggle('error',error);
+    region.hidden=false;
+    clearTimeout(clearTimer);
+    if (!error) clearTimer=setTimeout(()=>{region.hidden=true;},6500);
+  };
+  const snapshot = () => ({y:window.scrollY,focus:{name:document.activeElement?.getAttribute('name'),card:document.activeElement?.closest('[data-entry-id]')?.dataset.entryId,action:document.activeElement?.closest('form')?.getAttribute('action'),label:document.activeElement?.tagName==='BUTTON'?document.activeElement.textContent.trim():null},cards:[...document.querySelectorAll('[data-entry-id]')].map(el=>({id:el.dataset.entryId,y:el.getBoundingClientRect().top,bottom:el.getBoundingClientRect().bottom})).filter(r=>r.bottom>0)});
+  const restore = saved => {
+    const cards=[...document.querySelectorAll('[data-entry-id]')];
+    const anchor=saved.cards.find(r=>cards.some(c=>c.dataset.entryId===r.id));
+    if (anchor) {
+      const el=cards.find(c=>c.dataset.entryId===anchor.id);
+      window.scrollBy(0,el.getBoundingClientRect().top-anchor.y);
+    } else window.scrollTo(0,saved.y);
+    const f=saved.focus||{};
+    let scope=f.card?cards.find(c=>c.dataset.entryId===f.card):document.querySelector('main');
+    let target=f.name?scope?.querySelector('[name="'+CSS.escape(f.name)+'"]'):null;
+    if(!target && f.label)target=[...(scope?.querySelectorAll('button')||[])].find(b=>b.textContent.trim()===f.label && (!f.action || b.closest('form')?.getAttribute('action')===f.action));
+    if(!target && f.card)target=cards.find(c=>c.getBoundingClientRect().bottom>0)?.querySelector('button');
+    target?.focus({preventScroll:true});
+  };
+  async function refreshView(url=location.href,save=snapshot(),push=false) {
+    const version=++listRequest;
+    document.querySelector('main')?.setAttribute('aria-busy','true');
+    listController?.abort();listController=new AbortController();
+    const controller=listController;
+    const timer=setTimeout(()=>controller.abort(),15000);
+    try {
+      const response=await fetch(url,{signal:controller.signal,credentials:'same-origin',cache:'no-store'});
+      if (!response.ok) throw new Error('Не удалось обновить список. Повторите действие.');
+      const doc=new DOMParser().parseFromString(await response.text(),'text/html');
+      if (version!==listRequest) return;
+      const main=doc.querySelector('main');
+      if (!main || main.classList.contains('lock')) {sessionExpired=true;throw new Error('Сессия завершилась. Откройте /web в боте заново.');}
+      document.querySelector('main').replaceWith(main);
+      document.title=doc.title;
+      if (push) history.pushState({},'',url);
+      restore(save);
+    } finally {clearTimeout(timer);if(version===listRequest)document.querySelector('main')?.removeAttribute('aria-busy');}
+  }
+  function formError(form,text) {
+    let error=form.querySelector('.form-error');
+    if (!error) {error=document.createElement('p');error.className='form-error';error.setAttribute('role','alert');form.append(error);}
+    error.textContent=text;
+  }
+  function validForm(form) {
+    for(const field of form.querySelectorAll('input,select')) {
+      field.removeAttribute('aria-invalid');
+      if (!field.validity.valid) {
+        field.setAttribute('aria-invalid','true');
+        formError(form,'Проверьте заполнение поля «'+(field.getAttribute('aria-label')||field.labels?.[0]?.textContent.trim()||'Название')+'».');
+        field.focus({preventScroll:true});return false;
+      }
+    }
+    return true;
+  }
+  const dialog=document.getElementById('delete-dialog');
+  const confirmDelete=form=>new Promise(resolve=>{
+    const trigger=document.activeElement;
+    const title=form.closest('[data-title]')?.dataset.title||form.querySelector('[name=title]')?.value||'Тайтл';
+    dialog.querySelector('[data-delete-name]').textContent=title;
+    dialog.returnValue='cancel';
+    dialog.onclose=()=>{trigger?.focus({preventScroll:true});resolve(dialog.returnValue==='delete');};
+    dialog.showModal();dialog.querySelector('[data-delete-cancel]').focus({preventScroll:true});
+  });
+  document.addEventListener('submit',async event=>{
+    const form=event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if(form.method.toLowerCase()==='dialog')return;
+    event.preventDefault();
+    if (!validForm(form)) return;
+    if (mutationBusy) {toast('Дождитесь завершения текущего действия.');return;}
+    if (form.method.toLowerCase()==='get') {
+      const url=new URL(form.action);url.search=new URLSearchParams(new FormData(form)).toString();
+      try {await refreshView(url.href,snapshot(),true);}catch(error){if(error.name!=='AbortError')toast(error.message,true);}
+      return;
+    }
+    if (new URL(form.action).pathname==='/delete' && !(await confirmDelete(form))) return;
+    mutationBusy=true;
+    const saved=snapshot(),button=event.submitter;
+    form.setAttribute('aria-busy','true');
+    const buttons=[...document.querySelectorAll('button[type=submit],form button:not([type])')];
+    buttons.forEach(el=>el.disabled=true);
+    button?.setAttribute('aria-busy','true');
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+    try {
+      const data=new FormData(form);
+      const multipart=form.enctype==='multipart/form-data';
+      const response=await fetch(form.action,{method:'POST',credentials:'same-origin',headers:{'X-TVOE-UI':'async',...(multipart?{}:{'Content-Type':'application/x-www-form-urlencoded'})},body:multipart?data:new URLSearchParams(data),signal:controller.signal});
+      if (!response.ok) {
+        const text=new DOMParser().parseFromString(await response.text(),'text/html').body.textContent.trim();
+        throw new Error(response.status===403?'Сессия завершилась. Откройте /web в боте заново.':text||'Изменение не сохранено. Повторите действие.');
+      }
+      const result=await response.json();
+      try {await refreshView(location.href,saved);}catch(error){toast('Изменение сохранено. Не удалось обновить список - обновите страницу.',true);return;}
+      toast(result.message||'Изменение сохранено.');
+    }catch(error) {
+      const text=error.name==='AbortError'?'Ответ не получен. Обновите список перед повтором.':error.message;
+      formError(form,text);toast(text,true);
+    }finally{
+      clearTimeout(timer);mutationBusy=false;form.removeAttribute('aria-busy');button?.removeAttribute('aria-busy');buttons.forEach(el=>el.disabled=false);
+    }
+  });
+  document.addEventListener('click',async event=>{
+    const clear=event.target.closest('[data-clear-search]');
+    if(clear) {
+      event.preventDefault();
+      const form=clear.closest('form'),field=form.querySelector('[name=q]');field.value='';field.focus({preventScroll:true});form.requestSubmit();return;
+    }
+    const link=event.target.closest('a.mode,[data-load-more],[data-filter-reset]');
+    if(!link || event.ctrlKey || event.metaKey || event.shiftKey || event.button!==0)return;
+    event.preventDefault();
+    try {await refreshView(link.href,snapshot(),true);}catch(error){if(error.name!=='AbortError')toast(error.message,true);}
+  });
+  document.addEventListener('change',event=>{
+    if(event.target.matches('.dataset-controls select'))event.target.form.requestSubmit();
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Enter' && event.isComposing && event.target.matches('input'))event.preventDefault();
+  });
+  const hasDrafts=()=>[...document.querySelectorAll('form input:not([type=hidden]),form select')].some(e=>{
+    if(e.type==='file')return e.files.length>0;
+    if(e.tagName==='SELECT'){const initial=[...e.options].find(o=>o.defaultSelected)||e.options[0];return e.value!==initial?.value;}
+    return e.value!==e.defaultValue;
+  });
+  setInterval(()=>{
+    if(document.hidden || sessionExpired || mutationBusy || dialog.open || hasDrafts() || document.querySelector('main')?.getAttribute('aria-busy')==='true' || document.activeElement?.matches('input,select'))return;
+    refreshView(location.href,snapshot()).catch(error=>{if(error.name!=='AbortError')toast('Список не обновился. Сохранённые данные остаются на экране.',true);});
+  },60000);
+  window.addEventListener('popstate',()=>refreshView(location.href,snapshot()).catch(error=>toast(error.message,true)));
+})();
+'''
+
+def interaction_shell(nonce):
+    return ('<div id="action-status" class="action-status" role="status" aria-live="polite" hidden></div>'
+            '<dialog id="delete-dialog" aria-labelledby="delete-title"><h2 id="delete-title">Удалить тайтл?</h2><p data-delete-name></p><p>Тайтл исчезнет со всех вкладок, проверки остановятся. История сохранится. При необходимости можно добавить его вручную заново.</p><form method="dialog" novalidate class="actions"><button type="submit" value="cancel" class="secondary" data-action="delete-cancel" data-delete-cancel>Отмена</button><button type="submit" value="delete" class="danger" data-action="delete-confirm" data-delete-confirm>Удалить</button></form></dialog>'
+            '<script nonce="'+nonce+'">'+DASHBOARD_SCRIPT+'</script>')
+
+def added_stamp(store,row,view):
+    if view=='radar':return row.get('found_at') or ''
+    table={'watch':('watchlist','added_at'),'new':('review_queue','added_at'),'ads':('promotions','updated_at')}.get(view)
+    if table:
+        with store.lock:r=store.db.execute('SELECT '+table[1]+' FROM '+table[0]+' WHERE title_id=?',(row['id'],)).fetchone()
+        if r:return r[0] or ''
+    return row.get('first_seen') or ''
+
+
+def stamp_ru(stamp):
+    try:return datetime.fromisoformat(stamp.replace('Z','+00:00')).astimezone(ZoneInfo('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')
+    except (ValueError,AttributeError):return 'не указана'
+
+
+def dataset_rows(store,view,query='',mode='all',sort='added',kind='all',soon='all'):
+    promoted={r['id'] for r in promotion_rows(store)}
+    watched={r['id'] for r in store.watch_rows()}
+    by_view={
+        'catalog':[r for r in store.rows('title ASC','status!="watched"',10000) if r['id'] not in watched],
+        'new':store.new_rows(),
+        'signals':growth_rows(store,mode=='early'),
+        'watch':store.watch_rows(),
+        'ads':promotion_rows(store),
+        'radar':radar_rows(store),
+    }
+    result={}
+    for name,rows in by_view.items():
+        ready=[]
+        for r in rows:
+            identity=radar_identity(store,r) if name=='radar' else r
+            if not foreign_title(store,identity):continue
+            if name!='ads' and identity['id'] in promoted:continue
+            if name=='radar' and identity['id'].startswith('radar:') and deleted_name(store,r['title']):continue
+            info=origin_info(store,identity)
+            ready.append({**r,'display_kind':info.get('kind') or identity.get('type') or 'films','added_stamp':added_stamp(store,r,name)})
+        result[name]=ready
+    rows=result.get(view,[])
+    if query:rows=[r for r in rows if query.casefold() in r['title'].casefold()]
+    if kind in ('films','serials','cartoons'):rows=[r for r in rows if r['display_kind']==kind]
+    def identity(r):return radar_identity(store,r) if view=='radar' else r
+    def actual(r):
+        ident=identity(r)
+        if not ident['id'].startswith('radar:'):return ident
+        return {**ident,'poster_date':None,'status':'watched','total_count':None,'dynamics_json':None}
+    if mode in ('available','soon','unknown') and view=='catalog':rows=[r for r in rows if detail_for(store,actual(r))['availability']==mode]
+    if mode=='growth' and view=='catalog':rows=[r for r in rows if signal_fresh(store,actual(r)) and actual(r).get('trend')=='растёт']
+    if soon=='soon':rows=[r for r in rows if detail_for(store,actual(r))['availability']=='soon']
+    if soon=='available':rows=[r for r in rows if detail_for(store,actual(r))['availability']=='available']
+    if sort=='soon':rows=sorted(rows,key=lambda r:(poster_sort(actual(r).get('poster_date')),r['title'].casefold()))
+    elif sort=='growth':rows=sorted(rows,key=lambda r:((demand_comparison(actual(r)) or {}).get('percent') is not None,(demand_comparison(actual(r)) or {}).get('percent') or 0,r['title']),reverse=True)
+    elif sort=='demand' or mode=='top':rows=sorted(rows,key=lambda r:(actual(r).get('total_count') or 0,r['title']),reverse=True)
+    elif sort=='title':rows=sorted(rows,key=lambda r:r['title'].casefold())
+    else:
+        # SQLite insertion order breaks ties when several additions share a second.
+        with store.lock:order={r['title_id']:r['rowid'] for r in store.db.execute('SELECT rowid,title_id FROM watchlist')}
+        rows=sorted(rows,key=lambda r:(r.get('added_stamp',''),order.get(r['id'],0),r['id']),reverse=True)
+    return rows,result
+
+
+def dataset_controls(view,query,mode,sort,kind,soon):
+    esc=html.escape
+    def select(name,label,value,options):
+        return '<label>'+label+'<select name="'+name+'" aria-label="'+label+'">'+''.join('<option value="'+key+'" '+('selected' if key==value else '')+'>'+text+'</option>' for key,text in options)+'</select></label>'
+    return ('<form novalidate class="dataset-controls" action="/" method="get" novalidate><input type="hidden" name="view" value="'+view+'"><input type="hidden" name="mode" value="'+mode+'">'
+        +select('sort','Сортировка',sort,[('added','Сначала новые'),('soon','По дате появления'),('growth','По росту спроса'),('demand','По количеству запросов'),('title','По названию')])
+        +select('kind','Тип',kind,[('all','Все типы'),('films','Фильмы'),('serials','Сериалы'),('cartoons','Мультфильмы')])
+        +select('soon','Доступность',soon,[('all','Любая'),('soon','Скоро в TVOЁ'),('available','Есть в TVOЁ')])
+        +'<label class="dataset-query">Название<input type="search" name="q" value="'+esc(query,quote=True)+'" placeholder="Поиск по названию" aria-label="Поиск по названию"></label><button type="submit" name="clear" value="1" class="secondary" data-clear-search aria-label="Очистить поиск">×</button><button type="submit" class="secondary">Показать</button><a class="button secondary" data-filter-reset href="/?view='+view+'">Сбросить</a></form>')
+
+def dashboard_document(store, view, query, nonce, mode='all', csrf='', sort='added',kind='all',soon='all',limit=100):
     esc=html.escape;csrf_field=f'<input type="hidden" name="csrf" value="{esc(csrf,quote=True)}">'
     legacy={'soon':('catalog','soon'),'top':('catalog','top'),'growth':('catalog','growth')}
     view,mode=legacy.get(view,(view,mode));view=view if view in ('catalog','new','signals','watch','radar','ads') else 'catalog'
     if mode=='date':mode='all'
-    all_rows=store.rows('title ASC','status!="watched"',10000)
-    new_rows=store.new_rows();watch_rows=store.watch_rows();ad_rows=promotion_rows(store);signals=growth_rows(store);early=growth_rows(store,True);radar=radar_rows(store)
-    watched={r['id'] for r in watch_rows};promoted={r['id'] for r in ad_rows}
-    all_rows=[r for r in all_rows if r['id'] not in promoted]
-    watch_rows=[r for r in watch_rows if r['id'] not in promoted]
-    radar=[r for r in radar if (r.get('confirmed_id') or r.get('match_id')) not in promoted]
+    rows,by_view=dataset_rows(store,view,query,mode,sort,kind,soon)
+    all_rows=by_view['catalog'];new_rows=by_view['new'];watch_rows=by_view['watch'];ad_rows=by_view['ads'];signals=by_view['signals'];radar=by_view['radar']
+    watched={r['id'] for r in store.watch_rows()};promoted={r['id'] for r in promotion_rows(store)}
     tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
     links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
-    headings={'catalog':'Каталог тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы','radar':'Радар интереса · Россия','ads':'Фильмы и сериалы в рекламе'}
-    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Все отслеживаемые тайтлы со спросом выше 50 000. Рост не обязателен. Дату проверки и точность запроса смотрите в карточке.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
-    rows={'catalog':all_rows,'new':new_rows,'signals':early if mode=='early' else signals,'watch':watch_rows,'radar':radar,'ads':ad_rows}[view]
-    if view=='catalog':
-        if mode in ('available','soon','unknown'):rows=[r for r in rows if detail_for(store,r)['availability']==mode]
-        elif mode=='top':rows=sorted(rows,key=lambda r:r['total_count'] or 0,reverse=True)
-        elif mode=='growth':rows=sorted([r for r in rows if signal_fresh(store,r) and r['trend']=='растёт'],key=lambda r:r['delta'] or 0,reverse=True)
-    if query:rows=[r for r in rows if query.casefold() in (r['title']).casefold()]
-    filters=[('all','Все'),('available','Доступен'),('soon','Скоро'),('unknown','Не подтверждены'),('top','По спросу'),('growth','Растут')] if view=='catalog' else [('all','Выше 50 000'),('early','Начинают расти')] if view=='signals' else []
-    controls='<div class="modes">'+''.join(f'<a class="mode {"active" if mode==key else ""}" href="/?view={view}&amp;mode={key}">{label}</a>' for key,label in filters)+'</div>' if filters else ''
-    search=f'<form action="/" method="get"><input type="hidden" name="view" value="{view}"><input type="hidden" name="mode" value="{esc(mode,quote=True)}"><input type="search" name="q" value="{esc(query,quote=True)}" placeholder="Поиск по названию" aria-label="Поиск по названию"><button class="secondary" type="submit">Найти</button></form>'
+    headings={'catalog':'Каталог зарубежных тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы и сериалы','radar':'Радар зарубежного контента','ads':'Фильмы и сериалы в рекламе'}
+    descriptions={'catalog':'Только подтверждённо зарубежные произведения. Страна проверяется автоматически.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Спрос выше 50 000. Для зарубежных тайтлов из Радара также учитывается подтверждённый рост.','watch':'Последние добавленные показываются первыми. Российские и неопределённые тайтлы скрыты.','radar':'Зарубежные названия из публикаций. Wordstat проверяет спрос, а не число упоминаний.','ads':'Отмеченные вами зарубежные тайтлы. Предупреждения о подтверждённом падении спроса.'}
+    filters=[('all','Все'),('available','Доступен'),('soon','Скоро'),('unknown','Не подтверждены'),('top','По спросу'),('growth','Растут')] if view=='catalog' else [('all','Все сигналы'),('early','Начинают расти')] if view=='signals' else []
+    from urllib.parse import urlencode
+    controls='<div class="modes">'+''.join(f'<a class="mode {"active" if mode==key else ""}" href="/?'+esc(urlencode({'view':view,'mode':key,'sort':sort,'kind':kind,'soon':soon,'q':query}),quote=True)+f'">{label}</a>' for key,label in filters)+'</div>' if filters else ''
+    search=dataset_controls(view,query,mode,sort,kind,soon)
     add=''
     if view in ('watch','ads'):
         path='/watch' if view=='watch' else '/promotion'
         label='Добавить фильм или сериал' if view=='watch' else 'Добавить тайтл в рекламу'
         button='Следить' if view=='watch' else 'В рекламу'
-        add=f'<form class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><button type="submit">{button}</button></form>'
-    entries=''.join(radar_card(store,row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:100])
-    empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет отслеживаемых тайтлов со спросом выше 50 000 по выбранному фильтру. Тайтлы в рекламе и с остановленным слежением сюда не входят.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
+        add=f'<form novalidate class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><label>Год<input name="year" inputmode="numeric" maxlength="4" placeholder="Если известен"></label><label>Тип<select name="type" aria-label="Тип добавляемого тайтла"><option value="films">Фильм</option><option value="serials">Сериал</option><option value="cartoons">Мультфильм</option></select></label><button type="submit">{button}</button></form>'
+    entries=''.join(radar_card(store,row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:limit])
+    empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных зарубежных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет отслеживаемых тайтлов со спросом выше 50 000 по выбранному фильтру. Тайтлы в рекламе и с остановленным слежением сюда не входят.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
     if not entries:entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
     notices=''
     if view=='catalog' and not store.meta('catalog_feed_updated',''):notices='<p class="notice status-notice">Полный каталог TVOЁ пока не подключён. Сохраняем тайтлы из «Скоро», даже когда они исчезают из раздела. Доступность подтверждается отдельно.</p>'
     if view=='catalog':
-        notices+=(f'<details class="analysis source-list"><summary>Загрузить фид каталога TVOЁ</summary><form class="watch-add" action="/catalog-feed" method="post" enctype="multipart/form-data">{csrf_field}<label for="catalog-feed">Файл каталога TVOЁ · YML/XML</label><input id="catalog-feed" name="feed" type="file" accept=".xml,.yml,text/xml" required><button type="submit">Загрузить каталог</button></form><p class="notice">Первый импорт создаёт базовый каталог без массовых уведомлений. В дальнейшем новые доступные тайтлы попадают в «Новое». Используйте фид TVOЁ, где available означает фактическую доступность для просмотра.</p></details>')
+        notices+=(f'<details class="analysis source-list"><summary>Загрузить фид каталога TVOЁ</summary><form novalidate class="watch-add" action="/catalog-feed" method="post" enctype="multipart/form-data">{csrf_field}<label for="catalog-feed">Файл каталога TVOЁ · YML/XML</label><input id="catalog-feed" name="feed" type="file" accept=".xml,.yml,text/xml" required><button type="submit">Загрузить каталог</button></form><p class="notice">Первый импорт создаёт базовый каталог без массовых уведомлений. В дальнейшем новые доступные тайтлы попадают в «Новое». Используйте фид TVOЁ, где available означает фактическую доступность для просмотра.</p></details>')
         if store.meta('catalog_feed_error',''):notices+='<p class="notice status-notice">Не удалось обновить фид каталога. Последние данные сохранены.</p>'
     if view=='ads':notices+='<p class="notice">Предупреждение: падение не менее 30% на двух разных последовательных датах данных. Повторная загрузка одной даты не считается подтверждением. Даже при спросе ниже 50 000. Реклама автоматически не отключается.</p>'
-    if view=='radar':notices+=source_status(store)+'<p class="notice">Читаем доступные публичные ленты, без входа в закрытые каналы и без обхода защиты. Новые названия подтверждаются вручную перед проверкой Wordstat.</p>'
+    if view=='radar':notices+=source_status(store)+'<p class="notice">Читаем доступные публичные ленты, без входа в закрытые каналы и без обхода защиты. Страны: Wikidata. Новые названия проходят проверку идентичности перед Wordstat.</p>'
     queued_top=int(store.meta('wordstat_top_queue','0'));queued_dyn=int(store.meta('wordstat_dynamics_queue','0'))
     if queued_top or queued_dyn:notices+=f'<p class="notice status-notice">В очереди Wordstat: спрос - {queued_top}, динамика - {queued_dyn}. Проверки продолжаются автоматически в пределах суточных лимитов.</p>'
+    pending_origin=sum(origin_info(store,r)['status']=='unknown' for r in store.rows('title ASC','1=1',10000))
+    notices+=f'<p class="notice status-notice">Только зарубежные тайтлы. Страна уточняется у {pending_origin} записей - до подтверждения они скрыты. Россия и совместное производство с Россией исключены.</p>'
+    if store.meta('origin_error',''):notices+='<p class="notice status-notice">Источник стран временно недоступен. Неопределённые тайтлы скрыты; ранее проверенные сохранены.</p>'
     if store.meta('last_errors',''):notices+='<p class="notice status-notice">Часть данных не обновилась. Последние сохранённые значения доступны в карточках.</p>'
     updated=esc(short_date(store.meta('last_tvoe','')))
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Спрос на фильмы и сериалы</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{'<p class="notice">Показаны первые 100 записей. Используйте поиск.</p>' if len(rows)>100 else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main></body></html>'''
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Спрос на фильмы и сериалы</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form novalidate action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{('<a class="button secondary load-more" data-load-more href="/?'+esc(urlencode({'view':view,'q':query,'mode':mode,'sort':sort,'kind':kind,'soon':soon,'limit':min(10000,limit+100)}),quote=True)+'">Показать ещё</a>') if len(rows)>limit else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main>{interaction_shell(nonce)}</body></html>'''
 
 
 def start_dashboard(store, secret, allowed_id, port, app=None):
@@ -1445,7 +1901,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                             active=fields.get('active')
                             if active not in ('0','1'): raise ValueError('Выберите действие.')
                             if not ident:
-                                ident,added=store.add_watch(fields.get('title',''))
+                                ident,added=add_manual_title(store,fields.get('title',''),fields.get('type','films'),fields.get('year',''))
                                 refresh_id=ident if added else None
                             radar_id=fields.get('radar_id','')
                             if radar_id:
@@ -1467,7 +1923,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                                 row=store.db.execute('SELECT * FROM titles WHERE id=?',(ident,)).fetchone()
                                 if not row: raise ValueError('Фильм не найден.')
                                 kind=fields.get('type','films');query=fields.get('query','').strip()
-                                if kind not in ('films','serials') or len(query)>180 or any(ord(c)<32 for c in query):raise ValueError('Проверьте тип и запрос.')
+                                if kind not in ('films','serials','cartoons') or len(query)>180 or any(ord(c)<32 for c in query):raise ValueError('Проверьте тип и запрос.')
                                 old=detail_for(store,dict(row)).get('query_override') or ''
                                 set_availability(store,ident,fields.get('availability','unknown'),year=fields.get('year','').strip())
                                 if fields.get('availability')=='available' and not row['measured_at']:refresh_id=ident
@@ -1503,7 +1959,10 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     target = '/'
                 elif path == '/watch':
                     try:
-                        ident, added = store.add_watch(fields.get('title',[''])[0], fields.get('id',[''])[0])
+                        if not fields.get('id'):
+                            ident,added=add_manual_title(store,fields.get('title',[''])[0],fields.get('type',['films'])[0],fields.get('year',[''])[0])
+                        else:ident,added=store.add_watch(ident=fields['id'][0])
+                        with store.lock,store.db:store.db.execute('UPDATE watchlist SET added_at=? WHERE title_id=?',(now(),ident))
                         radar_id=fields.get('radar_id',[''])[0]
                         if radar_id:
                             with store.lock,store.db:
@@ -1523,6 +1982,9 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                         return self.respond(503)
                     app.refresh_async()
                     target = '/?refresh=started'
+                if self.headers.get('X-TVOE-UI')=='async':
+                    messages={'/watch':'Добавлено в «Следить». Страна и спрос проверяются автоматически.','/delete':'Тайтл удалён со всех вкладок. Проверки остановлены.','/promotion':'Рекламный статус сохранён.','/film':'Данные тайтла сохранены.','/refresh':'Обновление запущено.','/radar-confirm':'Тайтл принят на отслеживание.','/radar-dismiss':'Публикация скрыта.','/unwatch':'Тайтл убран из списка «Следить».','/catalog-feed':'Каталог загружен. Страны уточняются автоматически.'}
+                    return self.respond(200,json.dumps({'ok':True,'message':messages.get(path,'Изменения сохранены.')},ensure_ascii=False).encode(),'application/json; charset=utf-8')
                 self.send_response(303)
                 self.send_header('Location',target)
                 self.send_header('Cache-Control','no-store')
@@ -1554,8 +2016,11 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                 params = parse_qs(parsed.query)
                 view = params.get('view',['catalog'])[0]
                 mode = params.get('mode',['date'])[0]
-                query = params.get('q',[''])[0][:100].strip()
-                document = dashboard_document(store,view,query,nonce,mode,self.csrf_token())
+                query = '' if params.get('clear')==['1'] else params.get('q',[''])[0][:100].strip()
+                sort=params.get('sort',['added'])[0];kind=params.get('kind',['all'])[0];soon=params.get('soon',['all'])[0]
+                try:limit=max(100,min(10000,int(params.get('limit',['100'])[0])))
+                except ValueError:limit=100
+                with store.lock:document = dashboard_document(store,view,query,nonce,mode,self.csrf_token(),sort,kind,soon,limit)
                 if params.get('saved'):
                     document=document.replace('<main>','<main><p class="notice status-notice" role="status">Изменения сохранены.</p>',1)
                 if params.get('watch') == ['saved']:
@@ -1619,7 +2084,7 @@ class BotApp:
             if growing:message+=f'Рост {c["percent"]:.1f}%: {c["older"]:,} → {c["newer"]:,}, два полных периода по 7 дней.\n'
             else:message+='Рост пока не подтверждён.\n'
             message+=f'Запрос: {row["wordstat_query"]}\n'
-            if row['total_count']>50000:message+='Добавлен в «Сигналы».\n'
+            if row['total_count']>50000 or (growing and row['id'] in radar):message+='Добавлен в «Сигналы».\n'
             else:message+='Остаётся на отслеживании.\n'
             message+='Доступность в TVOЁ и результаты кампании проверяйте перед продвижением.'
             self.bot.send(message,MENU)
@@ -1636,6 +2101,9 @@ class BotApp:
             return
         if notify: self.status_message('🔄 Обновление запущено.')
         def run():
+            if watch_id is not None and origin_info(self.store,watch_id)['status']=='unknown':
+                try:refresh_origins(self.store,budget=1,target_id=watch_id)
+                except Exception as exc:print('Country metadata pending: '+type(exc).__name__,flush=True)
             if watch_id is None:
                 try:refresh_radar(self.store)
                 except Exception as exc:print('Radar refresh error: '+type(exc).__name__,flush=True)
@@ -1687,6 +2155,7 @@ class BotApp:
             self.bot.send(message, keyboard)
         elif command in ('ads','watch'):
             rows=promotion_rows(self.store) if command=='ads' else self.store.watch_rows()
+            rows=[r for r in rows if foreign_title(self.store,r)]
             heading='🎯 В рекламе' if command=='ads' else '👁 Отслеживаемые фильмы'
             for offset in range(0,max(1,len(rows)),10):
                 batch=rows[offset:offset+10]
@@ -1777,6 +2246,16 @@ def main():
                 if added:app.refresh_async(notify=False)
             except Exception as exc: print('Radar refresh error: '+type(exc).__name__,flush=True)
             time.sleep(1800)
+    def origin_schedule():
+        while True:
+            try:
+                if refresh_origins(store):
+                    try:app.send_new_alerts()
+                    except RuntimeError:pass
+                    app.refresh_async(notify=False)
+            except Exception as exc:print('Country metadata error: '+type(exc).__name__,flush=True)
+            time.sleep(300)
+    threading.Thread(target=origin_schedule,daemon=True).start()
     threading.Thread(target=radar_schedule,daemon=True).start()
     threading.Thread(target=schedule,daemon=True).start()
     app.loop()
