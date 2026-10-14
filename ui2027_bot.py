@@ -569,15 +569,20 @@ def radar_tracked_ids(store):
 
 
 def growth_rows(store, early=False):
-    rows=[];promoted={r['id'] for r in promotion_rows(store)};radar=radar_tracked_ids(store)
+    rows=[];promoted={r['id'] for r in promotion_rows(store)}
     for row in all_tracking(store):
-        if row['id'] in promoted or not fresh_demand(store,row):continue
-        c=demand_comparison(row);n=row['total_count'] or 0
+        if row['id'] in promoted:continue
+        n=row['total_count'] or 0
+        if not early:
+            # Demand threshold alone controls membership. Missing/stale dynamics
+            # and query uncertainty are shown on the card, not hidden by the list.
+            if n>50000:rows.append(row)
+            continue
+        if not fresh_demand(store,row):continue
+        c=demand_comparison(row)
         growing=bool(c and signal_fresh(store,row,c) and row['trend']=='растёт' and not store.meta('dynamics_error:'+row['id'],''))
-        if early:
-            if growing and 1000<=n<=50000 and c['older']>=100 and c['delta']>=100:rows.append(row)
-        elif n>50000 and (growing or row['id'] in radar):rows.append(row)
-    return sorted(rows,key=lambda r:(r['delta'] or 0,r['total_count'] or 0),reverse=True)
+        if growing and 1000<=n<=50000 and c['older']>=100 and c['delta']>=100:rows.append(row)
+    return sorted(rows,key=lambda r:(r['total_count'] or 0,r['delta'] or 0),reverse=True)
 
 
 def growth_alert_rows(store):
@@ -586,7 +591,7 @@ def growth_alert_rows(store):
         if row['id'] in promoted or not fresh_demand(store,row):continue
         c=demand_comparison(row)
         growing=bool(c and signal_fresh(store,row,c) and row['trend']=='растёт' and c['percent'] is not None and not store.meta('dynamics_error:'+row['id'],''))
-        if growing or (row['id'] in radar and (row['total_count'] or 0)>50000):result.append(row)
+        if growing or (row['total_count'] or 0)>50000:result.append(row)
     return result
 
 
@@ -960,6 +965,7 @@ class Analyzer:
                     self.store.measured(row['id'],query,note,ambiguous,count,None)
                     if count <= 50000:
                         self.store.set_meta('radar_alert:'+row['id'],'quiet')
+                        self.store.set_meta('demand_alert:'+row['id'],'quiet')
                     self.store.set_meta('top_error:'+row['id'],'')
                     stats['measured'] += 1
                 except APIError as exc:
@@ -1101,7 +1107,7 @@ def render_list(store, kind, page):
         rows = sorted(store.rows('title ASC', where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 10000), key=lambda r: poster_sort(r['poster_date']))[page*5:(page+1)*5]
     else:
         rows = store.rows(order, where+' AND id NOT IN (SELECT title_id FROM promotions WHERE active=1)', 5, page*5)
-    labels = {'top':'🔥 Популярное','growth':'📈 Растущий спрос','soon':'📅 Скоро в подписке','new':'🆕 Новые тайтлы'}
+    labels = {'top':'🔥 Популярное','growth':'🔎 Сигналы: спрос выше 50 000','soon':'📅 Скоро в подписке','new':'🆕 Новые тайтлы'}
     text = labels[kind] + f' - страница {page+1}\n\n' + ('\n\n'.join(item_text(row, page*5+i+1) for i,row in enumerate(rows)) if rows else 'Пока нет данных.')
     buttons = []
     if page:
@@ -1253,6 +1259,7 @@ def film_card(store,row,view,csrf,watched,promoted):
     badges=availability_badge(store,row)
     if not tracking_enabled(store,row['id']):badges+='<span class="badge warn">Слежение остановлено</span>'
     if row['ambiguous']:badges+='<span class="badge warn">Уточните запрос</span>'
+    if row['total_count'] is not None and not fresh_demand(store,row) and not row['ambiguous']:badges+='<span class="badge warn">Спрос требует обновления</span>'
     if c and not is_fresh:badges+='<span class="badge warn">Динамика устарела</span>'
     if view=='new':badges+='<span class="badge available">Опубликован · '+esc(short_date(d.get('available_at')))+' </span>'
     if row['id'] in promoted:badges+='<span class="badge">В рекламе</span>'
@@ -1325,7 +1332,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
     tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
     links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
     headings={'catalog':'Каталог тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы','radar':'Радар интереса · Россия','ads':'Фильмы и сериалы в рекламе'}
-    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Рост и спрос выше 50 000; для тайтлов из Радара - проверенный спрос выше 50 000.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
+    descriptions={'catalog':'Известные тайтлы TVOЁ. Проверяйте фактическую доступность перед продвижением.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Все отслеживаемые тайтлы со спросом выше 50 000. Рост не обязателен. Дату проверки и точность запроса смотрите в карточке.','watch':'Добавьте любой фильм или сериал, даже если его нет в TVOЁ.','radar':'Надёжно определённые названия отслеживаются автоматически. Рост подтверждает Wordstat, а не упоминание.','ads':'Отмеченные вами тайтлы. Предупреждения о подтверждённом падении спроса.'}
     rows={'catalog':all_rows,'new':new_rows,'signals':early if mode=='early' else signals,'watch':watch_rows,'radar':radar,'ads':ad_rows}[view]
     if view=='catalog':
         if mode in ('available','soon','unknown'):rows=[r for r in rows if detail_for(store,r)['availability']==mode]
@@ -1342,7 +1349,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf=''):
         button='Следить' if view=='watch' else 'В рекламу'
         add=f'<form class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><button type="submit">{button}</button></form>'
     entries=''.join(radar_card(store,row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:100])
-    empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет свежих сигналов по выбранным условиям. Старые данные не считаются текущим ростом.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
+    empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет отслеживаемых тайтлов со спросом выше 50 000 по выбранному фильтру. Тайтлы в рекламе и с остановленным слежением сюда не входят.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
     if not entries:entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
     notices=''
     if view=='catalog' and not store.meta('catalog_feed_updated',''):notices='<p class="notice status-notice">Полный каталог TVOЁ пока не подключён. Сохраняем тайтлы из «Скоро», даже когда они исчезают из раздела. Доступность подтверждается отдельно.</p>'
@@ -1603,11 +1610,11 @@ class BotApp:
         for row in growth_alert_rows(self.store):
             c=demand_comparison(row)
             growing=bool(c and signal_fresh(self.store,row,c) and row['trend']=='растёт' and c['percent'] is not None and not self.store.meta('dynamics_error:'+row['id'],''))
-            key=('growth_alert:' if growing else 'radar_alert:')+row['id']
+            key=('growth_alert:' if growing else 'demand_alert:')+row['id']
             if self.store.meta(key)=='sent':continue
             # A high-demand notice already includes growth when both happen together.
             count=f'{row["total_count"]:,}'.replace(',',' ')
-            message=(('📈 Спрос растёт: ' if growing else '🔎 Радар: спрос выше 50 000 - ')+row['title']+'\n'
+            message=(('📈 Спрос растёт: ' if growing else '🔎 Спрос выше 50 000: ')+row['title']+'\n'
                      f'Wordstat: {count} запросов за 30 дней.\n')
             if growing:message+=f'Рост {c["percent"]:.1f}%: {c["older"]:,} → {c["newer"]:,}, два полных периода по 7 дней.\n'
             else:message+='Рост пока не подтверждён.\n'
