@@ -19,6 +19,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from campaigns_wordstat import (setup_campaign_schema, import_ya_campaigns,
+    director_campaign_rows, director_pending_queries, director_save_measurement,
+    director_set_query, render_campaign_section)
+
 TVOE_URL = 'https://api.tvoe.live/collections'
 TVOE_COMING_SOON_URL = 'https://api.tvoe.live/coming-soon'
 WORDSTAT_URL = 'https://searchapi.api.cloud.yandex.net/v2/wordstat/'
@@ -245,6 +249,7 @@ class Store:
             self.db.execute('CREATE TABLE IF NOT EXISTS watchlist (title_id TEXT PRIMARY KEY, name_key TEXT UNIQUE NOT NULL, added_at TEXT NOT NULL)')
 
             film_schema(self)
+            setup_campaign_schema(self)
             self.origin_lock=threading.Lock()
             if 'family' not in {r[1] for r in self.db.execute('PRAGMA table_info(title_origin)')}:self.db.execute('ALTER TABLE title_origin ADD COLUMN family TEXT')
 
@@ -1211,6 +1216,26 @@ class Analyzer:
                     if 'HTTP 429' in str(exc):
                         self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
                         break
+            # Imported campaigns use the same Wordstat API budget and 429 backoff.
+            if watch_id is None:
+                remaining=max(0,self.top_budget-int(self.store.meta(top_key,'0')))
+                ad_pending=director_pending_queries(self.store)
+                self.store.set_meta('wordstat_campaign_queue',str(max(0,len(ad_pending)-remaining)))
+                if self.store.meta('wordstat_retry_at','')<=now():
+                    for ad_row in ad_pending[:remaining]:
+                        self.store.set_meta(top_key,str(int(self.store.meta(top_key,'0'))+1))
+                        try:
+                            result=self.wordstat.top(ad_row['query'])
+                            director_save_measurement(self.store,ad_row['group_key'],int(result['totalCount']))
+                            stats['measured']+=1
+                        except APIError as exc:
+                            with self.store.lock,self.store.db:
+                                self.store.db.execute('UPDATE director_queries SET error=? WHERE group_key=?',
+                                    (str(exc)[:300],ad_row['group_key']))
+                            stats['errors'].append(str(exc))
+                            if 'HTTP 429' in str(exc):
+                                self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
+                                break
             watched = {r['id'] for r in self.store.watch_rows()}
             candidates = [row for row in self.store.tracking_rows()
                           if row['total_count'] is not None and not row['ambiguous'] and row['wordstat_query']]
