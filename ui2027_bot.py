@@ -1886,15 +1886,15 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed','/delete'):
+            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed','/delete','/campaign-import','/campaign-query'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
                     size = int(self.headers.get('Content-Length','0'))
-                    if size < 0 or size > (8_100_000 if path=='/catalog-feed' else 16384 if path == '/ad' else 4096):
+                    if size < 0 or size > (8_100_000 if path in ('/catalog-feed','/campaign-import') else 16384 if path in ('/ad','/campaign-query') else 4096):
                         return self.respond(413)
                     raw=self.rfile.read(size)
-                    if path=='/catalog-feed':
+                    if path in ('/catalog-feed','/campaign-import'):
                         from email.parser import BytesParser
                         from email.policy import default
                         content_type=self.headers.get('Content-Type','')
@@ -1903,14 +1903,16 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                         fields={}
                         for part in message.iter_parts():
                             name=part.get_param('name',header='content-disposition')
-                            if name in ('csrf','feed'):fields[name]=[(part.get_payload(decode=True) or b'').decode('utf-8-sig')]
+                            if name in ('csrf','feed','campaign_file'):
+                                part_data=part.get_payload(decode=True) or b''
+                                fields[name]=[part_data if name=='campaign_file' else part_data.decode('utf-8-sig')]
                     else:
                         fields = parse_qs(raw.decode('utf-8'))
                 except (ValueError,UnicodeError):
                     return self.respond(400)
                 if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
                     return self.respond(403)
-                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed','/delete'):
+                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed','/delete','/campaign-import','/campaign-query'):
                     fields={k:v[0] for k,v in fields.items()}
                     ident=fields.get('id','')
                     refresh_id=None
@@ -1928,6 +1930,15 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                                 except RuntimeError:pass
                                 app.refresh_async(notify=False)
                             target='/?view=catalog&saved=feed'
+                        elif path=='/campaign-import':
+                            parsed=import_ya_campaigns(store,fields.get('campaign_file',b''))
+                            store.set_meta('wordstat_campaign_queue',str(parsed['title_groups']))
+                            if app is not None:app.refresh_async(notify=False)
+                            target='/?view=ads&saved=campaign-import'
+                        elif path=='/campaign-query':
+                            director_set_query(store,fields.get('group_key',''),fields.get('phrase',''),fields.get('campaign_id',''))
+                            if app is not None:app.refresh_async(notify=False)
+                            target='/?view=ads&saved=campaign-query'
                         elif path=='/promotion':
                             active=fields.get('active')
                             if active not in ('0','1'): raise ValueError('Выберите действие.')
@@ -2014,7 +2025,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     app.refresh_async()
                     target = '/?refresh=started'
                 if self.headers.get('X-TVOE-UI')=='async':
-                    messages={'/watch':'Добавлено в «Следить». Страна и спрос проверяются автоматически.','/delete':'Тайтл удалён со всех вкладок. Проверки остановлены.','/promotion':'Рекламный статус сохранён.','/film':'Данные тайтла сохранены.','/refresh':'Обновление запущено.','/radar-confirm':'Тайтл принят на отслеживание.','/radar-dismiss':'Публикация скрыта.','/unwatch':'Тайтл убран из списка «Следить».','/catalog-feed':'Каталог загружен. Страны уточняются автоматически.'}
+                    messages={'/watch':'Добавлено в «Следить». Страна и спрос проверяются автоматически.','/delete':'Тайтл удалён со всех вкладок. Проверки остановлены.','/promotion':'Рекламный статус сохранён.','/film':'Данные тайтла сохранены.','/refresh':'Обновление запущено.','/radar-confirm':'Тайтл принят на отслеживание.','/radar-dismiss':'Публикация скрыта.','/unwatch':'Тайтл убран из списка «Следить».','/catalog-feed':'Каталог загружен. Страны уточняются автоматически.','/campaign-import':'Кампании загружены. Wordstat проверит спрос в пределах общего лимита.','/campaign-query':'Запрос Wordstat обновлён. Проверка поставлена в очередь.'}
                     return self.respond(200,json.dumps({'ok':True,'message':messages.get(path,'Изменения сохранены.')},ensure_ascii=False).encode(),'application/json; charset=utf-8')
                 self.send_response(303)
                 self.send_header('Location',target)
