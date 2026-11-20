@@ -1223,6 +1223,12 @@ class Analyzer:
                 self.store.set_meta('wordstat_campaign_queue',str(max(0,len(ad_pending)-remaining)))
                 if self.store.meta('wordstat_retry_at','')<=now():
                     for ad_row in ad_pending[:remaining]:
+                        # Reuse an already-fresh identical query from the TVOE tracker.
+                        with self.store.lock:
+                            cached=self.store.db.execute('SELECT total_count,measured_at FROM titles WHERE wordstat_query=? AND total_count IS NOT NULL ORDER BY measured_at DESC LIMIT 1',(ad_row['query'],)).fetchone()
+                        if cached and fresh(cached['measured_at']):
+                            director_save_measurement(self.store,ad_row['group_key'],int(cached['total_count']))
+                            continue
                         self.store.set_meta(top_key,str(int(self.store.meta(top_key,'0'))+1))
                         try:
                             result=self.wordstat.top(ad_row['query'])
