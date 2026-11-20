@@ -19,6 +19,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from campaigns_wordstat import (setup_campaign_schema, import_ya_campaigns,
+    director_campaign_rows, director_pending_queries, director_save_measurement,
+    director_set_query, render_campaign_section)
+
 TVOE_URL = 'https://api.tvoe.live/collections'
 TVOE_COMING_SOON_URL = 'https://api.tvoe.live/coming-soon'
 WORDSTAT_URL = 'https://searchapi.api.cloud.yandex.net/v2/wordstat/'
@@ -245,6 +249,7 @@ class Store:
             self.db.execute('CREATE TABLE IF NOT EXISTS watchlist (title_id TEXT PRIMARY KEY, name_key TEXT UNIQUE NOT NULL, added_at TEXT NOT NULL)')
 
             film_schema(self)
+            setup_campaign_schema(self)
             self.origin_lock=threading.Lock()
             if 'family' not in {r[1] for r in self.db.execute('PRAGMA table_info(title_origin)')}:self.db.execute('ALTER TABLE title_origin ADD COLUMN family TEXT')
 
@@ -1211,6 +1216,32 @@ class Analyzer:
                     if 'HTTP 429' in str(exc):
                         self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
                         break
+            # Imported campaigns use the same Wordstat API budget and 429 backoff.
+            if watch_id is None:
+                remaining=max(0,self.top_budget-int(self.store.meta(top_key,'0')))
+                ad_pending=director_pending_queries(self.store)
+                self.store.set_meta('wordstat_campaign_queue',str(max(0,len(ad_pending)-remaining)))
+                if self.store.meta('wordstat_retry_at','')<=now():
+                    for ad_row in ad_pending[:remaining]:
+                        # Reuse an already-fresh identical query from the TVOE tracker.
+                        with self.store.lock:
+                            cached=self.store.db.execute('SELECT total_count,measured_at FROM titles WHERE wordstat_query=? AND total_count IS NOT NULL ORDER BY measured_at DESC LIMIT 1',(ad_row['query'],)).fetchone()
+                        if cached and fresh(cached['measured_at']):
+                            director_save_measurement(self.store,ad_row['group_key'],int(cached['total_count']))
+                            continue
+                        self.store.set_meta(top_key,str(int(self.store.meta(top_key,'0'))+1))
+                        try:
+                            result=self.wordstat.top(ad_row['query'])
+                            director_save_measurement(self.store,ad_row['group_key'],int(result['totalCount']))
+                            stats['measured']+=1
+                        except APIError as exc:
+                            with self.store.lock,self.store.db:
+                                self.store.db.execute('UPDATE director_queries SET error=? WHERE group_key=?',
+                                    (str(exc)[:300],ad_row['group_key']))
+                            stats['errors'].append(str(exc))
+                            if 'HTTP 429' in str(exc):
+                                self.store.set_meta('wordstat_retry_at',(datetime.now(UTC)+timedelta(hours=1)).isoformat())
+                                break
             watched = {r['id'] for r in self.store.watch_rows()}
             candidates = [row for row in self.store.tracking_rows()
                           if row['total_count'] is not None and not row['ambiguous'] and row['wordstat_query']]
@@ -1446,6 +1477,8 @@ def title_analysis(store, row, csrf_field):
 DASHBOARD_CSS = '''
 :root{--bg:#f7f8f6;--white:#fff;--ink:#172421;--muted:#69746e;--line:#dfe5df;--green:#125b43;--soft:#e9f5ed;--warn:#fff2df;--red:#9a403d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green)}button,input,select{font:inherit}button,.button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 16px;border-radius:10px;border:1px solid var(--green);background:var(--green);color:white;font-weight:650;text-decoration:none;text-align:center}button.secondary,.button.secondary{background:white;color:var(--ink);border-color:var(--line)}button:hover,.button:hover{filter:brightness(.94)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79b49a;outline-offset:3px}input,select{border:1px solid #cbd5cc;border-radius:9px;background:#fff;color:var(--ink);padding:10px 12px;min-height:44px;min-width:0;max-width:100%}form{margin:0}.head{max-width:1200px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:28px 24px 18px}.brand{font-size:30px;letter-spacing:-1px;font-weight:800;text-decoration:none;color:var(--ink)}.brand small{font-size:16px;font-weight:500;letter-spacing:0;color:var(--muted);display:block}.stamp{font-size:12px;color:var(--muted);text-align:right}.stamp strong{display:block;color:var(--ink);font-size:13px}main{max-width:1200px;margin:auto;padding:0 24px 56px}.hero{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:12px 0 22px}.hero h1{font-size:30px;letter-spacing:-.8px;line-height:1.18;margin:0 0 5px}.hero p,.section-head p{margin:0;color:var(--muted)}.hero-facts{display:flex;gap:10px;align-items:center}.hero-facts>span{font-size:12px;color:var(--muted);max-width:160px}nav{display:flex;gap:6px;background:white;border:1px solid var(--line);border-radius:13px;padding:7px;margin-bottom:24px}.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 8px;border-radius:9px;text-decoration:none;color:var(--ink);white-space:nowrap;font-weight:600}.tab.active{background:var(--green);color:#fff}.tab small{font-size:11px;opacity:.7}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:18px}.section-head h2{font-size:23px;margin:0;letter-spacing:-.5px}.section-head p{max-width:540px;font-size:13px}.controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}.controls form{display:flex;gap:8px}.controls input[type=search]{width:230px}.modes{display:flex;flex-wrap:wrap;gap:7px}.mode{display:block;padding:8px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;font-size:13px}.mode.active{background:var(--green);color:white;border-color:var(--green)}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.entry{border:1px solid var(--line);border-radius:15px;background:#fff;padding:20px;min-width:0}.card-top{display:grid;grid-template-columns:80px minmax(0,1fr);gap:16px}.poster{width:80px;height:112px;border-radius:9px;object-fit:cover;background:#ecf0eb}.poster-placeholder{display:flex;align-items:center;justify-content:center;color:var(--green);font-size:32px;font-weight:700}.title{font-size:19px;line-height:1.3;margin:0 0 7px;overflow-wrap:anywhere}.title a{text-decoration:none;color:var(--ink)}.detail{font-size:12px;color:var(--muted);margin-bottom:9px;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:4px 8px;font-size:12px;font-weight:600;margin:2px 4px 6px 0;background:#edf0ed;color:var(--muted)}.badge.available{background:#dff3e5;color:var(--green)}.badge.soon,.badge.warn{background:var(--warn);color:#87551d}.decline-card{border:2px solid var(--red);background:#fff5f4}.badge.fall{background:#fbe9e7;color:var(--red)}.demand{font-weight:750;font-size:21px;line-height:1.4}.demand small{font-size:12px;font-weight:400;color:var(--muted)}.trend{color:var(--green);font-size:15px;font-weight:700}.fall-text{color:var(--red)}.spark{display:block;width:100%;height:68px;margin:12px 0 4px;color:var(--green)}.spark.falling{color:var(--red)}.data-date{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions form{display:inline-flex}.actions button,.actions .button{font-size:12px;padding:9px 12px}.analysis{margin-top:13px;border-top:1px solid var(--line);padding-top:10px;font-size:12px;overflow-wrap:anywhere}.analysis summary{cursor:pointer;color:var(--muted);min-height:34px;padding:5px 0}.analysis p{color:var(--muted)}.analysis .data-error{color:var(--red)}.demand-chart{width:100%;height:120px;color:var(--green)}.edit-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.edit-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.edit-form .wide{grid-column:1/-1}.edit-form input,.edit-form select{width:100%}.edit-form button{justify-self:start}.watch-add{width:100%;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff;display:flex;gap:8px;flex-wrap:wrap}.watch-add label{width:100%;font-size:13px;font-weight:600}.watch-add input{flex:1;width:auto;min-width:120px}.empty{padding:32px;border:1px dashed var(--line);border-radius:12px;grid-column:1/-1;color:var(--muted);background:#fff}.empty strong{display:block;margin-bottom:6px;color:var(--ink)}.notice{font-size:12px;line-height:1.6;color:var(--muted);margin:18px 0}.status-notice{background:#fff8e9;border:1px solid #e6d8ba;border-radius:10px;padding:12px 16px}.source-list{margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;font-size:12px}.source-list summary{font-weight:600;cursor:pointer;min-height:30px}.source-row{display:flex;justify-content:space-between;align-items:start;gap:16px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px}.source-row span{color:var(--muted);text-align:right}.radar-card .title{font-size:18px}.radar-card .reason{color:var(--green);margin:8px 0}.lock{max-width:520px;margin:12vh auto;padding:28px}.lock h1{font-size:26px}.health-line{font-size:12px;color:var(--muted);margin-top:24px}.danger{color:var(--red)!important}.pagination{display:flex;gap:9px;justify-content:center;margin-top:20px}@media(max-width:760px){.head{padding:20px 16px 12px;align-items:start}.brand{font-size:25px}.brand small{font-size:12px}.stamp{font-size:10px;max-width:125px}.stamp strong{font-size:11px}main{padding:0 16px 40px}.hero{display:block;margin-top:14px}.hero h1{font-size:26px}.hero p{font-size:13px}.hero-facts{margin-top:14px}.hero-facts>span{max-width:none}nav{flex-wrap:wrap;gap:4px;padding:5px}.tab{flex:1 0 28%;padding:10px 5px;font-size:12px}.section-head{display:block}.section-head p{margin-top:6px}.controls{display:block}.controls>form{margin-top:12px;width:100%}.controls input[type=search]{width:auto;flex:1}.modes{margin-bottom:12px}.list{grid-template-columns:1fr}.entry{padding:16px}.card-top{grid-template-columns:68px minmax(0,1fr);gap:12px}.poster{width:68px;height:96px}.title{font-size:17px}.demand{font-size:19px}.actions{gap:7px}.source-row{display:block}.source-row span{display:block;text-align:left;margin-top:3px}.watch-add input{flex-basis:55%}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 :root{--scroll-thumb:#a5b6ac;--scroll-track:#eef2ee;--scroll-hover:#788f80}html{scrollbar-gutter:stable;scrollbar-color:var(--scroll-thumb) var(--scroll-track);scrollbar-width:auto}*{scrollbar-color:var(--scroll-thumb) var(--scroll-track)}*::-webkit-scrollbar{width:12px;height:12px}*::-webkit-scrollbar-track{background:var(--scroll-track)}*::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border:3px solid var(--scroll-track);border-radius:8px}*::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover)}.list{overflow-anchor:none}.watch-add #add-title{flex:1 0 100%;width:100%}.watch-add label:not([for]){display:grid;gap:5px;flex:1;min-width:120px;width:auto;font-size:12px;font-weight:400;color:var(--muted)}.watch-add label input,.watch-add label select{width:100%}.dataset-controls{width:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:end}.controls .dataset-controls input[type=search]{width:100%;min-width:0}.dataset-controls label{display:grid;gap:5px;font-size:12px;color:var(--muted);min-width:135px;flex:1}.dataset-controls select,.dataset-controls input{width:100%}.dataset-query{flex:2!important}.action-status{position:fixed;bottom:calc(16px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 32px);padding:12px 16px;border:1px solid var(--green);border-radius:10px;background:var(--soft);color:var(--green);z-index:20}.action-status.error{background:#fff0ed;color:var(--red);border-color:var(--red)}.action-status[hidden]{display:none}.form-error{color:var(--red);font-size:12px;flex-basis:100%;margin:8px 0}button:disabled{opacity:.55;cursor:wait}button[aria-busy=true]{box-shadow:inset 0 0 0 2px #ffffff66}dialog{border:1px solid var(--line);border-radius:15px;max-width:480px;width:calc(100vw - 32px);max-height:calc(100dvh - 40px);overflow:auto;padding:24px;color:var(--ink);background:var(--white)}dialog::backdrop{background:#17242166}dialog h2{font-size:22px;margin-top:0}dialog .danger{background:var(--red);border-color:var(--red);color:white!important}.load-more{margin-top:20px}@media(max-width:760px){.dataset-controls{display:grid!important;grid-template-columns:1fr 1fr}.controls .dataset-controls input[type=search]{width:100%;min-width:0}.dataset-controls label{min-width:0}.dataset-controls .dataset-query{grid-column:1/-1}.dataset-controls button,.dataset-controls a{width:100%}}@media(forced-colors:active){*{scrollbar-color:auto}.action-status,dialog{border:1px solid CanvasText}}
+
+.director-import{display:grid;gap:16px;margin:16px 0 24px}.director-import h3{font-size:20px;margin:10px 0 0}.director-upload,.director-query{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin:10px 0}.director-upload label{flex:1;min-width:230px}.director-upload input{display:block;width:100%;margin-top:6px}.director-query input{flex:1;min-width:190px}.director-group{background:#fff;border:1px solid var(--line);border-radius:16px;padding:18px;display:grid;gap:10px}.director-group h4{font-size:19px;margin:0}.director-group h4 small{font-size:13px;color:var(--muted);font-weight:500}.director-demand{margin:0;font-size:16px}.director-demand strong{font-size:25px;color:var(--green)}.director-row{display:grid;grid-template-columns:minmax(230px,2.3fr) repeat(3,minmax(100px,1fr));align-items:center;gap:15px;padding:10px 0;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}.director-row strong{display:block;color:var(--ink);font-size:15px;white-space:nowrap}.director-name{color:var(--ink);overflow-wrap:anywhere;font-weight:600}.director-name small{display:block;color:var(--muted);font-weight:400}.director-generic{margin-bottom:18px}.director-generic .director-query{margin:4px 0 12px}@media(max-width:750px){.director-row{grid-template-columns:1fr 1fr}.director-name{grid-column:1/-1}}
 
 '''
 
@@ -1787,7 +1820,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf='', sort='add
     rows,by_view=dataset_rows(store,view,query,mode,sort,kind,soon)
     all_rows=by_view['catalog'];new_rows=by_view['new'];watch_rows=by_view['watch'];ad_rows=by_view['ads'];signals=by_view['signals'];radar=by_view['radar']
     watched={r['id'] for r in store.watch_rows()};promoted={r['id'] for r in promotion_rows(store)}
-    tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows))]
+    tabs=[('catalog','Каталог',len(all_rows)),('new','Новое',len(new_rows)),('signals','Сигналы',len(signals)),('watch','Следить',len(watch_rows)),('radar','Радар',len(radar)),('ads','Реклама',len(ad_rows)+len(director_campaign_rows(store)))]
     links=''.join(f'<a class="tab {"active" if view==k else ""}" href="/?view={k}" {"aria-current=page" if view==k else ""}>{label}<small>{count}</small></a>' for k,label,count in tabs)
     headings={'catalog':'Каталог зарубежных тайтлов','new':'Новое в подписке','signals':'Сигналы спроса','watch':'Отслеживаемые фильмы и сериалы','radar':'Радар зарубежного контента','ads':'Фильмы и сериалы в рекламе'}
     descriptions={'catalog':'Только подтверждённо зарубежные произведения. Страна проверяется автоматически.','new':'Доступны в TVOЁ. Продолжаем проверять спрос до переноса в рекламу.','signals':'Спрос выше 50 000. Для зарубежных тайтлов из Радара также учитывается подтверждённый рост.','watch':'Последние добавленные показываются первыми. Российские и неопределённые тайтлы скрыты.','radar':'Зарубежные названия из публикаций. Wordstat проверяет спрос, а не число упоминаний.','ads':'Отмеченные вами зарубежные тайтлы. Предупреждения о подтверждённом падении спроса.'}
@@ -1795,6 +1828,7 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf='', sort='add
     from urllib.parse import urlencode
     controls='<div class="modes">'+''.join(f'<a class="mode {"active" if mode==key else ""}" href="/?'+esc(urlencode({'view':view,'mode':key,'sort':sort,'kind':kind,'soon':soon,'q':query}),quote=True)+f'">{label}</a>' for key,label in filters)+'</div>' if filters else ''
     search=dataset_controls(view,query,mode,sort,kind,soon)
+    campaign_panel=render_campaign_section(store,csrf_field,query) if view=='ads' else ''
     add=''
     if view in ('watch','ads'):
         path='/watch' if view=='watch' else '/promotion'
@@ -1803,7 +1837,8 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf='', sort='add
         add=f'<form novalidate class="watch-add" action="{path}" method="post">{csrf_field}<input type="hidden" name="active" value="1"><label for="add-title">{label}</label><input id="add-title" name="title" maxlength="160" required placeholder="Введите название"><label>Год<input name="year" inputmode="numeric" maxlength="4" placeholder="Если известен"></label><label>Тип<select name="type" aria-label="Тип добавляемого тайтла"><option value="films">Фильм</option><option value="serials">Сериал</option><option value="cartoons">Мультфильм</option></select></label><button type="submit">{button}</button></form>'
     entries=''.join(radar_card(store,row,csrf_field) if view=='radar' else film_card(store,row,view,csrf_field,watched,promoted) for row in rows[:limit])
     empty={'catalog':'Каталог пока пуст. Коллекция TVOЁ обновляется автоматически.','new':'Нет опубликованных зарубежных тайтлов, ожидающих проверки. Будущие премьеры здесь не отображаются.','signals':'Нет отслеживаемых тайтлов со спросом выше 50 000 по выбранному фильтру. Тайтлы в рекламе и с остановленным слежением сюда не входят.','watch':'Введите название и нажмите «Следить». Проверка начнётся в фоне в пределах лимитов.','radar':'Подходящих публикаций пока нет. Состояние каждого источника указано выше.','ads':'Отметьте тайтл кнопкой «В рекламу» или добавьте название выше.'}
-    if not entries:entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
+    if not entries and view=='ads' and director_campaign_rows(store):entries=''
+    if not entries and not (view=='ads' and director_campaign_rows(store)):entries=f'<div class="empty"><strong>{"Ничего не найдено" if query else "Пока нет тайтлов"}</strong>{"Попробуйте другое название." if query else empty[view]}</div>'
     notices=''
     if view=='catalog' and not store.meta('catalog_feed_updated',''):notices='<p class="notice status-notice">Полный каталог TVOЁ пока не подключён. Сохраняем тайтлы из «Скоро», даже когда они исчезают из раздела. Доступность подтверждается отдельно.</p>'
     if view=='catalog':
@@ -1813,12 +1848,14 @@ def dashboard_document(store, view, query, nonce, mode='all', csrf='', sort='add
     if view=='radar':notices+=source_status(store)+'<p class="notice">Читаем доступные публичные ленты, без входа в закрытые каналы и без обхода защиты. Страны: Wikidata. Новые названия проходят проверку идентичности перед Wordstat.</p>'
     queued_top=int(store.meta('wordstat_top_queue','0'));queued_dyn=int(store.meta('wordstat_dynamics_queue','0'))
     if queued_top or queued_dyn:notices+=f'<p class="notice status-notice">В очереди Wordstat: спрос - {queued_top}, динамика - {queued_dyn}. Проверки продолжаются автоматически в пределах суточных лимитов.</p>'
+    if view=='ads' and store.meta('wordstat_campaign_queue','0') not in ('','0'):
+        notices+='<p class="notice status-notice">Кампании в очереди Wordstat: '+esc(store.meta('wordstat_campaign_queue','0'))+'. Используется общий суточный лимит API.</p>'
     pending_origin=sum(origin_info(store,r)['status']=='unknown' for r in store.rows('title ASC','1=1',10000))
     notices+=f'<p class="notice status-notice">Только зарубежные тайтлы. Страна уточняется у {pending_origin} записей - до подтверждения они скрыты. Россия и совместное производство с Россией исключены.</p>'
     if store.meta('origin_error',''):notices+='<p class="notice status-notice">Источник стран временно недоступен. Неопределённые тайтлы скрыты; ранее проверенные сохранены.</p>'
     if store.meta('last_errors',''):notices+='<p class="notice status-notice">Часть данных не обновилась. Последние сохранённые значения доступны в карточках.</p>'
     updated=esc(short_date(store.meta('last_tvoe','')))
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Спрос на фильмы и сериалы</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form novalidate action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}<div class="list">{entries}</div>{('<a class="button secondary load-more" data-load-more href="/?'+esc(urlencode({'view':view,'q':query,'mode':mode,'sort':sort,'kind':kind,'soon':soon,'limit':min(10000,limit+100)}),quote=True)+'">Показать ещё</a>') if len(rows)>limit else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main>{interaction_shell(nonce)}</body></html>'''
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>{headings[view]} · TVOЁ</title><style nonce="{nonce}">{DASHBOARD_CSS}</style></head><body><header><div class="head"><a class="brand" href="/">TVOЁ<small>Аналитика спроса</small></a><div class="stamp">Коллекция проверена<strong>{updated}</strong></div></div></header><main><section class="hero"><div><h1>Спрос на фильмы и сериалы</h1><p>Спрос в России, публикации и ваши рекламные решения.</p></div><div class="hero-facts"><span>TVOЁ каждый час<br>Wordstat: кеш 24 часа<br>Новые - в ближайшем цикле</span><form novalidate action="/refresh" method="post">{csrf_field}<button type="submit">↻ Обновить</button></form></div></section><nav aria-label="Разделы">{links}</nav><div class="section-head"><h2>{headings[view]}</h2><p>{descriptions[view]}</p></div>{add}<div class="controls">{controls}{search}</div>{notices}{campaign_panel}<div class="list">{entries}</div>{('<a class="button secondary load-more" data-load-more href="/?'+esc(urlencode({'view':view,'q':query,'mode':mode,'sort':sort,'kind':kind,'soon':soon,'limit':min(10000,limit+100)}),quote=True)+'">Показать ещё</a>') if len(rows)>limit else ''}<p class="health-line">Wordstat показывает поисковые запросы, а не просмотры фильма. Решение о рекламе принимаете вы.</p></main>{interaction_shell(nonce)}</body></html>'''
 
 
 def start_dashboard(store, secret, allowed_id, port, app=None):
@@ -1855,15 +1892,15 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed','/delete'):
+            if path in ('/refresh','/review','/ad','/watch','/unwatch','/promotion','/film','/radar-confirm','/radar-dismiss','/catalog-feed','/delete','/campaign-import','/campaign-query'):
                 if not self.authorized():
                     return self.respond(403)
                 try:
                     size = int(self.headers.get('Content-Length','0'))
-                    if size < 0 or size > (8_100_000 if path=='/catalog-feed' else 16384 if path == '/ad' else 4096):
+                    if size < 0 or size > (8_100_000 if path in ('/catalog-feed','/campaign-import') else 16384 if path in ('/ad','/campaign-query') else 4096):
                         return self.respond(413)
                     raw=self.rfile.read(size)
-                    if path=='/catalog-feed':
+                    if path in ('/catalog-feed','/campaign-import'):
                         from email.parser import BytesParser
                         from email.policy import default
                         content_type=self.headers.get('Content-Type','')
@@ -1872,14 +1909,16 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                         fields={}
                         for part in message.iter_parts():
                             name=part.get_param('name',header='content-disposition')
-                            if name in ('csrf','feed'):fields[name]=[(part.get_payload(decode=True) or b'').decode('utf-8-sig')]
+                            if name in ('csrf','feed','campaign_file'):
+                                part_data=part.get_payload(decode=True) or b''
+                                fields[name]=[part_data if name=='campaign_file' else part_data.decode('utf-8-sig')]
                     else:
                         fields = parse_qs(raw.decode('utf-8'))
                 except (ValueError,UnicodeError):
                     return self.respond(400)
                 if not hmac.compare_digest(fields.get('csrf',[''])[0], self.csrf_token()):
                     return self.respond(403)
-                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed','/delete'):
+                if path in ('/promotion','/film','/radar-confirm','/radar-dismiss','/unwatch','/catalog-feed','/delete','/campaign-import','/campaign-query'):
                     fields={k:v[0] for k,v in fields.items()}
                     ident=fields.get('id','')
                     refresh_id=None
@@ -1897,6 +1936,15 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                                 except RuntimeError:pass
                                 app.refresh_async(notify=False)
                             target='/?view=catalog&saved=feed'
+                        elif path=='/campaign-import':
+                            parsed=import_ya_campaigns(store,fields.get('campaign_file',b''))
+                            store.set_meta('wordstat_campaign_queue',str(parsed['title_groups']))
+                            if app is not None:app.refresh_async(notify=False)
+                            target='/?view=ads&saved=campaign-import'
+                        elif path=='/campaign-query':
+                            director_set_query(store,fields.get('group_key',''),fields.get('phrase',''),fields.get('campaign_id',''))
+                            if app is not None:app.refresh_async(notify=False)
+                            target='/?view=ads&saved=campaign-query'
                         elif path=='/promotion':
                             active=fields.get('active')
                             if active not in ('0','1'): raise ValueError('Выберите действие.')
@@ -1983,7 +2031,7 @@ def start_dashboard(store, secret, allowed_id, port, app=None):
                     app.refresh_async()
                     target = '/?refresh=started'
                 if self.headers.get('X-TVOE-UI')=='async':
-                    messages={'/watch':'Добавлено в «Следить». Страна и спрос проверяются автоматически.','/delete':'Тайтл удалён со всех вкладок. Проверки остановлены.','/promotion':'Рекламный статус сохранён.','/film':'Данные тайтла сохранены.','/refresh':'Обновление запущено.','/radar-confirm':'Тайтл принят на отслеживание.','/radar-dismiss':'Публикация скрыта.','/unwatch':'Тайтл убран из списка «Следить».','/catalog-feed':'Каталог загружен. Страны уточняются автоматически.'}
+                    messages={'/watch':'Добавлено в «Следить». Страна и спрос проверяются автоматически.','/delete':'Тайтл удалён со всех вкладок. Проверки остановлены.','/promotion':'Рекламный статус сохранён.','/film':'Данные тайтла сохранены.','/refresh':'Обновление запущено.','/radar-confirm':'Тайтл принят на отслеживание.','/radar-dismiss':'Публикация скрыта.','/unwatch':'Тайтл убран из списка «Следить».','/catalog-feed':'Каталог загружен. Страны уточняются автоматически.','/campaign-import':'Кампании загружены. Wordstat проверит спрос в пределах общего лимита.','/campaign-query':'Запрос Wordstat обновлён. Проверка поставлена в очередь.'}
                     return self.respond(200,json.dumps({'ok':True,'message':messages.get(path,'Изменения сохранены.')},ensure_ascii=False).encode(),'application/json; charset=utf-8')
                 self.send_response(303)
                 self.send_header('Location',target)
