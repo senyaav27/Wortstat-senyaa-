@@ -100,7 +100,7 @@ import subprocess
 pid=subprocess.check_output(['systemctl','show','tvoe.service','-p','MainPID','--value'],text=True).strip()
 port='8080'
 try:
-  for entry in open('/proc/'+pid+'/environ','rb').read().split(b'\\0'):
+  for entry in open('/proc/'+pid+'/environ','rb').read().split(b'\0'):
     if entry.startswith(b'PORT='):
       port=entry.split(b'=',1)[1].decode()
 except (OSError,ValueError):pass
