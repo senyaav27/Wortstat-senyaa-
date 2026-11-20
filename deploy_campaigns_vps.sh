@@ -95,7 +95,18 @@ mv -f "$APP.new-campaign" "$APP"
 mv -f "$MOD.new-campaign" "$MOD"
 systemctl start "$UNIT"
 echo "[5/5] Проверяем работу..."
-PORT=8080
+PORT=$(/usr/bin/python3 - <<'PY'
+import subprocess
+pid=subprocess.check_output(['systemctl','show','tvoe.service','-p','MainPID','--value'],text=True).strip()
+port='8080'
+try:
+  for entry in open('/proc/'+pid+'/environ','rb').read().split(b'\\0'):
+    if entry.startswith(b'PORT='):
+      port=entry.split(b'=',1)[1].decode()
+except (OSError,ValueError):pass
+print(port if port.isdecimal() and 1<=int(port)<=65535 else '8080')
+PY
+)
 for i in 1 2 3 4 5 6 7 8 9 10 11 12;do
   if systemctl is-active --quiet "$UNIT" && curl -fsS --max-time 3 http://127.0.0.1:$PORT/health 2>/dev/null | grep -qx ok;then
     CHANGED=0
