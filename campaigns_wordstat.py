@@ -184,6 +184,9 @@ def import_ya_campaigns(store, raw):
         store.db.execute('UPDATE director_campaigns SET in_latest_import=0')
         for item in parsed['campaigns']:
             key = item['group_key']
+            prior = store.db.execute('SELECT group_key FROM director_campaigns WHERE campaign_id=?', (item['campaign_id'],)).fetchone()
+            if not key and prior and prior['group_key'].startswith('custom:'):
+                key = prior['group_key']  # Keep a manually assigned query on reimport.
             if key:
                 store.db.execute('''INSERT OR IGNORE INTO director_queries(group_key,title,query)
                                    VALUES(?,?,?)''', (key, item['title'], item['title']))
